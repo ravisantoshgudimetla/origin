@@ -109,7 +109,7 @@ func NewDockercfgController(cl kclientset.Interface, serviceAccountInformer shar
 		},
 	)*/
 	e.serviceAccountController = informer
-	e.serviceAccountCache = NewEtcdMutationCache(serviceAccountInformer.Informer())
+	e.serviceAccountCache = NewEtcdMutationCache(serviceAccountInformer.Indexer())
 
 	tokenSecretSelector := fields.OneTermEqualSelector(api.SecretTypeField, string(api.SecretTypeServiceAccountToken))
 	e.secretCache, e.secretController = cache.NewInformer(
