@@ -25,6 +25,7 @@ import (
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/pkg/watch"
+	"github.com/openshift/origin/pkg/controller/shared"
 
 	osautil "github.com/openshift/origin/pkg/serviceaccounts/util"
 )
@@ -59,14 +60,29 @@ type DockercfgControllerOptions struct {
 }
 
 // NewDockercfgController returns a new *DockercfgController.
-func NewDockercfgController(cl kclientset.Interface, options DockercfgControllerOptions) *DockercfgController {
+func NewDockercfgController(cl kclientset.Interface, serviceAccountInformer shared.ServiceAccountInformer, options DockercfgControllerOptions) *DockercfgController {
 	e := &DockercfgController{
 		client:               cl,
 		queue:                workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 		dockerURLsIntialized: options.DockerURLsIntialized,
 	}
 
-	var serviceAccountCache cache.Store
+	//var serviceAccountCache cache.Store
+	informer := serviceAccountInformer.Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+				serviceAccount := obj.(*api.ServiceAccount)
+				glog.V(5).Infof("Adding service account %s", serviceAccount.Name)
+				e.enqueueServiceAccount(serviceAccount)
+			},
+			UpdateFunc: func(old, cur interface{}) {
+				serviceAccount := cur.(*api.ServiceAccount)
+				glog.V(5).Infof("Updating service account %s", serviceAccount.Name)
+				// Resync on service object relist.
+				e.enqueueServiceAccount(serviceAccount)
+			},
+	})
+	/*
 	serviceAccountCache, e.serviceAccountController = cache.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
@@ -91,8 +107,9 @@ func NewDockercfgController(cl kclientset.Interface, options DockercfgController
 				e.enqueueServiceAccount(serviceAccount)
 			},
 		},
-	)
-	e.serviceAccountCache = NewEtcdMutationCache(serviceAccountCache)
+	)*/
+	e.serviceAccountController = informer
+	e.serviceAccountCache = NewEtcdMutationCache(serviceAccountInformer.Informer())
 
 	tokenSecretSelector := fields.OneTermEqualSelector(api.SecretTypeField, string(api.SecretTypeServiceAccountToken))
 	e.secretCache, e.secretController = cache.NewInformer(
@@ -129,7 +146,7 @@ type DockercfgController struct {
 	dockerURLsIntialized chan struct{}
 
 	serviceAccountCache      MutationCache
-	serviceAccountController *cache.Controller
+	serviceAccountController cache.SharedInformer
 	secretCache              cache.Store
 	secretController         *cache.Controller
 

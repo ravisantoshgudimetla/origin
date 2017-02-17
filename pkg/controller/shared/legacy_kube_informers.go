@@ -19,6 +19,58 @@ type replicationControllerInformer struct {
 	*sharedInformerFactory
 }
 
+type ServiceAccountInformer interface {
+	Informer() cache.SharedIndexInformer
+	Indexer() cache.Indexer
+	Lister() *cache.StoreToServiceAccountLister
+
+}
+
+type serviceAccountInformer struct {
+	*sharedInformerFactory
+}
+
+func (f *serviceAccountInformer) Informer() cache.SharedIndexInformer {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	informerObj := &kapi.ServiceAccount{}
+	informerType := reflect.TypeOf(informerObj)
+	informer, exists := f.informers[informerType]
+	if exists {
+		return informer
+	}
+	lw := f.customListerWatchers.GetListerWatcher(kapi.Resource("serviceaccounts"))
+	if lw == nil {
+		lw = &cache.ListWatch{
+			ListFunc: func(options kapi.ListOptions) (runtime.Object, error) {
+				return f.kubeClient.Core().ServiceAccounts(kapi.NamespaceAll).List(options)
+			},
+			WatchFunc: func(options kapi.ListOptions) (watch.Interface, error) {
+				return f.kubeClient.Core().ServiceAccounts(kapi.NamespaceAll).Watch(options)
+			},
+		}
+	}
+	informer = cache.NewSharedIndexInformer(
+		lw,
+		informerObj,
+		f.defaultResync,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
+	f.informers[informerType] = informer
+	return informer
+}
+
+func (f *serviceAccountInformer) Indexer() cache.Indexer {
+	informer := f.Informer()
+	return informer.GetIndexer()
+}
+
+func (f *serviceAccountInformer) Lister() *cache.StoreToServiceAccountLister {
+	informer := f.Informer()
+	return &cache.StoreToServiceAccountLister{Indexer: informer.GetIndexer()}
+}
+
 func (f *replicationControllerInformer) Informer() cache.SharedIndexInformer {
 	f.lock.Lock()
 	defer f.lock.Unlock()

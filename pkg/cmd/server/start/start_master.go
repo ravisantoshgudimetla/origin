@@ -46,6 +46,7 @@ import (
 	override "github.com/openshift/origin/pkg/quota/admission/clusterresourceoverride"
 	overrideapi "github.com/openshift/origin/pkg/quota/admission/clusterresourceoverride/api"
 	"github.com/openshift/origin/pkg/version"
+	"github.com/openshift/origin/pkg/controller/shared"
 )
 
 type MasterOptions struct {
@@ -589,7 +590,7 @@ func startControllers(oc *origin.MasterConfig, kc *kubernetes.MasterConfig) erro
 	}
 
 	// Start these first, because they provide credentials for other controllers' clients
-	oc.RunServiceAccountsController()
+	oc.RunServiceAccountsController(oc.Informers)
 	oc.RunServiceAccountTokensController(controllerManagerOptions)
 	// used by admission controllers
 	oc.RunServiceAccountPullSecretsControllers()

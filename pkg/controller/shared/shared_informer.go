@@ -30,11 +30,13 @@ type InformerFactory interface {
 	SecurityContextConstraints() SecurityContextConstraintsInformer
 	ClusterResourceQuotas() ClusterResourceQuotaInformer
 
+
 	KubernetesInformers() informers.SharedInformerFactory
 
 	// TODO switch to the generated upstream informers once the kube 1.6 rebase is
 	// in
 	ReplicationControllers() ReplicationControllerInformer
+	ServiceAccount() ServiceAccountInformer
 }
 
 // ListerWatcherOverrides allows a caller to specify special behavior for particular ListerWatchers
@@ -147,4 +149,9 @@ func (f *sharedInformerFactory) KubernetesInformers() informers.SharedInformerFa
 // TODO switch to upstream generated informers once kube 1.6 is in and remove these.
 func (f *sharedInformerFactory) ReplicationControllers() ReplicationControllerInformer {
 	return &replicationControllerInformer{sharedInformerFactory: f}
+}
+
+// TODO switch to upstream generated informers once kube 1.6 is in and remove these.
+func (f *sharedInformerFactory) ServiceAccount() ServiceAccountInformer {
+	return &serviceAccountInformer{sharedInformerFactory: f}
 }
