@@ -5,7 +5,7 @@ metadata:
   annotations:
     "openshift.io/display-name": Prometheus
     description: |
-      A monitoring solution for an OpenShift cluster - collect and gather metrics from nodes, services, and the infrastructure. This is a tech preview feature.
+      A monitoring solution for an OpenShift cluster - collect and gather metrics from nodes, services, and the infrastructure.
     iconClass: icon-cogs
     tags: "monitoring,prometheus,time-series"
 parameters:
@@ -14,10 +14,10 @@ parameters:
   value: kube-system
 - description: The location of the proxy image
   name: IMAGE_PROXY
-  value: openshift/oauth-proxy:v1.0.0
+  value: registry.svc.ci.openshift.org/ci/oauth-proxy:latest
 - description: The location of the prometheus image
   name: IMAGE_PROMETHEUS
-  value: openshift/prometheus:v2.0.0-dev
+  value: registry.svc.ci.openshift.org/ci/prometheus:latest
 - description: The session secret for the proxy
   name: SESSION_SECRET
   generate: expression
@@ -64,6 +64,8 @@ objects:
     name: prometheus
     namespace: "${NAMESPACE}"
   spec:
+    externalIPs:
+    - 54.203.65.135 
     ports:
     - name: prometheus
       port: 443
@@ -126,9 +128,9 @@ objects:
 
         - name: prometheus
           args:
-          - --storage.tsdb.retention=6h
-          - --config.file=/etc/prometheus/prometheus.yml
-          - --web.listen-address=localhost:9090
+          - -storage.tsdb.retention=6h
+          - -config.file=/etc/prometheus/prometheus.yml
+          - -web.listen-address=localhost:9090
           image: ${IMAGE_PROMETHEUS}
           imagePullPolicy: IfNotPresent
           volumeMounts:
@@ -291,3 +293,42 @@ objects:
         - source_labels: [__meta_kubernetes_service_name]
           action: replace
           target_label: kubernetes_name
+      # Example scrape config for pods
+      #
+      # The relabeling allows the actual pod scrape endpoint to be configured via the
+      # following annotations:
+      #
+      # * `prometheus.io/scrape`: Only scrape pods that have a value of `true`
+      # * `prometheus.io/path`: If the metrics path is not `/metrics` override this.
+      # * `prometheus.io/port`: Scrape the pod on the indicated port instead of the
+      # pod's declared ports (default is a port-free target if none are declared).
+      - job_name: 'kubernetes-pods'
+
+        kubernetes_sd_configs:
+        - role: pod
+
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          # TODO: this should be per target
+          insecure_skip_verify: true
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: kubernetes_pod_name
