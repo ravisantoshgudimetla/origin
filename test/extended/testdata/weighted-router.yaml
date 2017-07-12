@@ -12,6 +12,7 @@ objects:
     labels:
       test: weighted-router
   spec:
+    terminationGracePeriodSeconds: 1
     containers:
     - name: router
       image: ${IMAGE}
@@ -118,6 +119,7 @@ objects:
       test: weightedrouter1
       endpoints: weightedrouter1
   spec:
+    terminationGracePeriodSeconds: 1
     containers:
     - name: test
       image: openshift/hello-openshift
@@ -134,6 +136,7 @@ objects:
       test: weightedrouter2
       endpoints: weightedrouter2
   spec:
+    terminationGracePeriodSeconds: 1
     containers:
     - name: test
       image: openshift/hello-openshift

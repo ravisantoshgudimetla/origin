@@ -88,6 +88,11 @@ func (f *FakeDocker) RemoveContainer(id string) error {
 	return f.RemoveContainerError
 }
 
+// KillContainer kills a fake container
+func (f *FakeDocker) KillContainer(id string) error {
+	return nil
+}
+
 // GetScriptsURL returns a default STI scripts URL
 func (f *FakeDocker) GetScriptsURL(image string) (string, error) {
 	f.DefaultURLImage = image
@@ -208,4 +213,9 @@ func (f *FakeDocker) BuildImage(opts BuildImageOptions) error {
 // GetLabels returns the labels of the image
 func (f *FakeDocker) GetLabels(name string) (map[string]string, error) {
 	return f.Labels, f.LabelsError
+}
+
+// CheckReachable returns if the Docker daemon is reachable from s2i
+func (f *FakeDocker) CheckReachable() error {
+	return nil
 }

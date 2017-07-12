@@ -6,20 +6,14 @@ source "$(dirname "${BASH_SOURCE}")/../../hack/lib/init.sh"
 os::cleanup::tmpdir
 os::util::environment::setup_all_server_vars
 
-function cleanup()
-{
-	out=$?
-	kill $OS_PID
-
-	os::test::junit::generate_oscmd_report
-
-	os::log::info "Exiting"
-	exit $out
+function cleanup() {
+	return_code=$?
+	os::test::junit::generate_report
+	os::cleanup::all
+	os::util::describe_return_code "${return_code}"
+	exit "${return_code}"
 }
-
-trap "exit" INT TERM
 trap "cleanup" EXIT
-
 
 os::log::info "Starting server as distinct processes"
 os::log::info "`openshift version`"

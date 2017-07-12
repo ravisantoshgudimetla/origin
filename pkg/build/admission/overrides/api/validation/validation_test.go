@@ -3,10 +3,10 @@ package validation
 import (
 	"testing"
 
-	"k8s.io/kubernetes/pkg/util/validation/field"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	overridesapi "github.com/openshift/origin/pkg/build/admission/overrides/api"
-	buildapi "github.com/openshift/origin/pkg/build/api"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 )
 
 func TestValidateBuildOverridesConfig(t *testing.T) {

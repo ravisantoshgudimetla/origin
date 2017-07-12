@@ -1,4 +1,4 @@
-package images
+package storage
 
 import (
 	"fmt"
@@ -7,12 +7,11 @@ import (
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
-	"k8s.io/kubernetes/pkg/api/meta"
-	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/openshift/origin/pkg/cmd/admin/migrate"
 	"github.com/openshift/origin/pkg/cmd/templates"
@@ -67,7 +66,7 @@ func NewCmdMigrateAPIStorage(name, fullName string, f *clientcmd.Factory, in io.
 			ErrOut: errout,
 
 			Include: []string{"*"},
-			DefaultExcludes: []unversioned.GroupResource{
+			DefaultExcludes: []schema.GroupResource{
 				// openshift resources:
 				{Resource: "appliedclusterresourcequotas"},
 				{Resource: "imagestreamimages"}, {Resource: "imagestreamtags"}, {Resource: "imagestreammappings"}, {Resource: "imagestreamimports"},
@@ -87,6 +86,10 @@ func NewCmdMigrateAPIStorage(name, fullName string, f *clientcmd.Factory, in io.
 				{Resource: "replicationcontrollerdummies.extensions"},
 				{Resource: "podtemplates"},
 				{Resource: "selfsubjectaccessreviews", Group: "authorization.k8s.io"}, {Resource: "localsubjectaccessreviews", Group: "authorization.k8s.io"},
+
+				// skip kube RBAC resources for now because no one will have rights to update them yet
+				{Resource: "roles", Group: "rbac.authorization.k8s.io"}, {Resource: "rolebindings", Group: "rbac.authorization.k8s.io"},
+				{Resource: "clusterroles", Group: "rbac.authorization.k8s.io"}, {Resource: "clusterrolebindings", Group: "rbac.authorization.k8s.io"},
 			},
 			// Resources known to share the same storage
 			OverlappingResources: []sets.String{
@@ -185,9 +188,7 @@ func (o MigrateAPIStorageOptions) Validate() error {
 }
 
 func (o MigrateAPIStorageOptions) Run() error {
-	return o.ResourceOptions.Visitor().Visit(func(info *resource.Info) (migrate.Reporter, error) {
-		return o.transform(info.Object)
-	})
+	return o.ResourceOptions.Visitor().Visit(migrate.AlwaysRequiresMigration)
 }
 
 // save invokes the API to alter an object. The reporter passed to this method is the same returned by
@@ -232,17 +233,4 @@ func (o *MigrateAPIStorageOptions) save(info *resource.Info, reporter migrate.Re
 		}
 	}
 	return nil
-}
-
-// transform checks image references on the provided object and returns either a reporter (indicating
-// that the object was recognized and whether it was updated) or an error.
-func (o *MigrateAPIStorageOptions) transform(obj runtime.Object) (migrate.Reporter, error) {
-	return reporter(true), nil
-}
-
-// reporter implements the Reporter interface for a boolean.
-type reporter bool
-
-func (r reporter) Changed() bool {
-	return bool(r)
 }

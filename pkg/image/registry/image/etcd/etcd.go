@@ -1,11 +1,12 @@
 package etcd
 
 import (
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapi "k8s.io/kubernetes/pkg/api"
 
-	"github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	"github.com/openshift/origin/pkg/image/registry/image"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -18,19 +19,19 @@ type REST struct {
 // NewREST returns a new REST.
 func NewREST(optsGetter restoptions.Getter) (*REST, error) {
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.Image{} },
-		NewListFunc:       func() runtime.Object { return &api.ImageList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &imageapi.Image{} },
+		NewListFunc:       func() runtime.Object { return &imageapi.ImageList{} },
 		PredicateFunc:     image.Matcher,
-		QualifiedResource: api.Resource("images"),
+		QualifiedResource: imageapi.Resource("images"),
 
 		CreateStrategy: image.Strategy,
 		UpdateStrategy: image.Strategy,
+		DeleteStrategy: image.Strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: image.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: image.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, err
 	}
 

@@ -4,31 +4,31 @@ import (
 	"fmt"
 	"reflect"
 
-	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/client-go/tools/cache"
+	kexternalinformers "k8s.io/kubernetes/pkg/client/informers/informers_generated/externalversions"
 	kresourcequota "k8s.io/kubernetes/pkg/controller/resourcequota"
 
 	osclient "github.com/openshift/origin/pkg/client"
-	"github.com/openshift/origin/pkg/controller/shared"
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
+	imageinternalversion "github.com/openshift/origin/pkg/image/generated/informers/internalversion/image/internalversion"
 )
 
 // replenishmentControllerFactory implements ReplenishmentControllerFactory
 type replenishmentControllerFactory struct {
-	isInformer shared.ImageStreamInformer
+	isInformer imageinternalversion.ImageStreamInformer
 }
 
 var _ kresourcequota.ReplenishmentControllerFactory = &replenishmentControllerFactory{}
 
 // NewReplenishmentControllerFactory returns a factory that knows how to build controllers
 // to replenish resources when updated or deleted
-func NewReplenishmentControllerFactory(isInformer shared.ImageStreamInformer) kresourcequota.ReplenishmentControllerFactory {
+func NewReplenishmentControllerFactory(isInformer imageinternalversion.ImageStreamInformer) kresourcequota.ReplenishmentControllerFactory {
 	return &replenishmentControllerFactory{
 		isInformer: isInformer,
 	}
 }
 
-func (r *replenishmentControllerFactory) NewController(options *kresourcequota.ReplenishmentControllerOptions) (cache.ControllerInterface, error) {
+func (r *replenishmentControllerFactory) NewController(options *kresourcequota.ReplenishmentControllerOptions) (cache.Controller, error) {
 	gk := options.GroupKind
 	switch {
 	case imageapi.IsKindOrLegacy("ImageStream", gk):
@@ -54,9 +54,9 @@ func ImageStreamReplenishmentUpdateFunc(options *kresourcequota.ReplenishmentCon
 }
 
 // NewAllResourceReplenishmentControllerFactory returns a ReplenishmentControllerFactory  that knows how to replenish all known resources
-func NewAllResourceReplenishmentControllerFactory(informerFactory shared.InformerFactory, osClient osclient.Interface, kubeClientSet clientset.Interface) kresourcequota.ReplenishmentControllerFactory {
+func NewAllResourceReplenishmentControllerFactory(informerFactory kexternalinformers.SharedInformerFactory, imageStreamInformer imageinternalversion.ImageStreamInformer, osClient osclient.Interface) kresourcequota.ReplenishmentControllerFactory {
 	return kresourcequota.UnionReplenishmentControllerFactory{
-		kresourcequota.NewReplenishmentControllerFactory(informerFactory.KubernetesInformers(), kubeClientSet),
-		NewReplenishmentControllerFactory(informerFactory.ImageStreams()),
+		kresourcequota.NewReplenishmentControllerFactory(informerFactory),
+		NewReplenishmentControllerFactory(imageStreamInformer),
 	}
 }

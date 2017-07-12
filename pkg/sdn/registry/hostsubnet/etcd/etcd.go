@@ -1,11 +1,12 @@
 package etcd
 
 import (
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapi "k8s.io/kubernetes/pkg/api"
 
-	"github.com/openshift/origin/pkg/sdn/api"
+	sdnapi "github.com/openshift/origin/pkg/sdn/apis/network"
 	"github.com/openshift/origin/pkg/sdn/registry/hostsubnet"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -18,19 +19,19 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against subnets
 func NewREST(optsGetter restoptions.Getter) (*REST, error) {
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.HostSubnet{} },
-		NewListFunc:       func() runtime.Object { return &api.HostSubnetList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &sdnapi.HostSubnet{} },
+		NewListFunc:       func() runtime.Object { return &sdnapi.HostSubnetList{} },
 		PredicateFunc:     hostsubnet.Matcher,
-		QualifiedResource: api.Resource("hostsubnets"),
+		QualifiedResource: sdnapi.Resource("hostsubnets"),
 
 		CreateStrategy: hostsubnet.Strategy,
 		UpdateStrategy: hostsubnet.Strategy,
+		DeleteStrategy: hostsubnet.Strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: hostsubnet.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: hostsubnet.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, err
 	}
 

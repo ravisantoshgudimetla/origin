@@ -10,14 +10,15 @@ import (
 	context "github.com/docker/distribution/context"
 	registryauth "github.com/docker/distribution/registry/auth"
 
-	kerrors "k8s.io/kubernetes/pkg/api/errors"
-	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/restclient"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	restclient "k8s.io/client-go/rest"
+	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
 
-	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	"github.com/openshift/origin/pkg/util/httprequest"
 
 	"github.com/openshift/origin/pkg/dockerregistry/server/audit"
@@ -53,7 +54,7 @@ const (
 // RegistryClient encapsulates getting access to the OpenShift API.
 type RegistryClient interface {
 	// Clients return the authenticated clients to use with the server.
-	Clients() (client.Interface, kclientset.Interface, error)
+	Clients() (client.Interface, kcoreclient.CoreInterface, error)
 	// SafeClientConfig returns a client config without authentication info.
 	SafeClientConfig() restclient.Config
 }
@@ -71,9 +72,12 @@ func NewRegistryClient(config *clientcmd.Config) RegistryClient {
 }
 
 // Client returns the authenticated client to use with the server.
-func (r *registryClient) Clients() (client.Interface, kclientset.Interface, error) {
+func (r *registryClient) Clients() (client.Interface, kcoreclient.CoreInterface, error) {
 	oc, kc, err := r.config.Clients()
-	return oc, kc, err
+	if err != nil {
+		return nil, nil, err
+	}
+	return oc, kc.Core(), err
 }
 
 // SafeClientConfig returns a client config without authentication info.
@@ -309,7 +313,7 @@ func (ac *AccessController) Authorized(ctx context.Context, accessRecords ...reg
 	}
 
 	// In case of docker login, hits endpoint /v2
-	if len(bearerToken) > 0 {
+	if len(bearerToken) > 0 && !isMetricsBearerToken(ctx, bearerToken) {
 		user, userid, err := verifyOpenShiftUser(ctx, osClient)
 		if err != nil {
 			return nil, ac.wrapErr(ctx, err)
@@ -390,6 +394,16 @@ func (ac *AccessController) Authorized(ctx context.Context, accessRecords ...reg
 				}
 			}
 
+		case "metrics":
+			switch access.Action {
+			case "get":
+				if !isMetricsBearerToken(ctx, bearerToken) {
+					return nil, ac.wrapErr(ctx, ErrOpenShiftAccessDenied)
+				}
+			default:
+				return nil, ac.wrapErr(ctx, ErrUnsupportedAction)
+			}
+
 		case "admin":
 			switch access.Action {
 			case "prune":
@@ -463,7 +477,7 @@ func getOpenShiftAPIToken(ctx context.Context, req *http.Request) (string, error
 }
 
 func verifyOpenShiftUser(ctx context.Context, client client.UsersInterface) (string, string, error) {
-	userInfo, err := client.Users().Get("~")
+	userInfo, err := client.Users().Get("~", metav1.GetOptions{})
 	if err != nil {
 		context.GetLogger(ctx).Errorf("Get user failed with error: %s", err)
 		if kerrors.IsUnauthorized(err) || kerrors.IsForbidden(err) {
@@ -531,4 +545,12 @@ func verifyPruneAccess(ctx context.Context, client client.SubjectAccessReviews) 
 		return ErrOpenShiftAccessDenied
 	}
 	return nil
+}
+
+func isMetricsBearerToken(ctx context.Context, token string) bool {
+	config := ConfigurationFrom(ctx)
+	if config.Metrics.Enabled {
+		return config.Metrics.Secret == token
+	}
+	return false
 }

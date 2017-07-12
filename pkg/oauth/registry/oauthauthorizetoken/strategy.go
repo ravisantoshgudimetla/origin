@@ -3,17 +3,19 @@ package oauthauthorizetoken
 import (
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/rest"
+	kstorage "k8s.io/apiserver/pkg/storage"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/runtime"
-	kstorage "k8s.io/kubernetes/pkg/storage"
-	"k8s.io/kubernetes/pkg/util/validation/field"
 
 	scopeauthorizer "github.com/openshift/origin/pkg/authorization/authorizer/scope"
-	"github.com/openshift/origin/pkg/oauth/api"
-	"github.com/openshift/origin/pkg/oauth/api/validation"
+	oauthapi "github.com/openshift/origin/pkg/oauth/apis/oauth"
+	"github.com/openshift/origin/pkg/oauth/apis/oauth/validation"
 	"github.com/openshift/origin/pkg/oauth/registry/oauthclient"
 )
 
@@ -31,7 +33,11 @@ func NewStrategy(clientGetter oauthclient.Getter) strategy {
 	return strategy{ObjectTyper: kapi.Scheme, clientGetter: clientGetter}
 }
 
-func (strategy) PrepareForUpdate(ctx kapi.Context, obj, old runtime.Object) {}
+func (strategy) DefaultGarbageCollectionPolicy() rest.GarbageCollectionPolicy {
+	return rest.Unsupported
+}
+
+func (strategy) PrepareForUpdate(ctx apirequest.Context, obj, old runtime.Object) {}
 
 // NamespaceScoped is false for OAuth objects
 func (strategy) NamespaceScoped() bool {
@@ -42,7 +48,7 @@ func (strategy) GenerateName(base string) string {
 	return base
 }
 
-func (strategy) PrepareForCreate(ctx kapi.Context, obj runtime.Object) {
+func (strategy) PrepareForCreate(ctx apirequest.Context, obj runtime.Object) {
 }
 
 // Canonicalize normalizes the object after validation.
@@ -50,11 +56,11 @@ func (strategy) Canonicalize(obj runtime.Object) {
 }
 
 // Validate validates a new token
-func (s strategy) Validate(ctx kapi.Context, obj runtime.Object) field.ErrorList {
-	token := obj.(*api.OAuthAuthorizeToken)
+func (s strategy) Validate(ctx apirequest.Context, obj runtime.Object) field.ErrorList {
+	token := obj.(*oauthapi.OAuthAuthorizeToken)
 	validationErrors := validation.ValidateAuthorizeToken(token)
 
-	client, err := s.clientGetter.GetClient(ctx, token.ClientName)
+	client, err := s.clientGetter.GetClient(ctx, token.ClientName, &metav1.GetOptions{})
 	if err != nil {
 		return append(validationErrors, field.InternalError(field.NewPath("clientName"), err))
 	}
@@ -66,9 +72,9 @@ func (s strategy) Validate(ctx kapi.Context, obj runtime.Object) field.ErrorList
 }
 
 // ValidateUpdate validates an update
-func (s strategy) ValidateUpdate(ctx kapi.Context, obj, old runtime.Object) field.ErrorList {
-	oldToken := old.(*api.OAuthAuthorizeToken)
-	newToken := obj.(*api.OAuthAuthorizeToken)
+func (s strategy) ValidateUpdate(ctx apirequest.Context, obj, old runtime.Object) field.ErrorList {
+	oldToken := old.(*oauthapi.OAuthAuthorizeToken)
+	newToken := obj.(*oauthapi.OAuthAuthorizeToken)
 	return validation.ValidateAuthorizeTokenUpdate(newToken, oldToken)
 }
 
@@ -83,7 +89,7 @@ func (strategy) AllowUnconditionalUpdate() bool {
 
 // GetAttrs returns labels and fields of a given object for filtering purposes
 func GetAttrs(o runtime.Object) (labels.Set, fields.Set, error) {
-	obj, ok := o.(*api.OAuthAuthorizeToken)
+	obj, ok := o.(*oauthapi.OAuthAuthorizeToken)
 	if !ok {
 		return nil, nil, fmt.Errorf("not a OAuthAuthorizeToken")
 	}
@@ -100,6 +106,6 @@ func Matcher(label labels.Selector, field fields.Selector) kstorage.SelectionPre
 }
 
 // SelectableFields returns a field set that can be used for filter selection
-func SelectableFields(obj *api.OAuthAuthorizeToken) fields.Set {
-	return api.OAuthAuthorizeTokenToSelectableFields(obj)
+func SelectableFields(obj *oauthapi.OAuthAuthorizeToken) fields.Set {
+	return oauthapi.OAuthAuthorizeTokenToSelectableFields(obj)
 }

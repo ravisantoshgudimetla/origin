@@ -1,11 +1,12 @@
 package etcd
 
 import (
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapi "k8s.io/kubernetes/pkg/api"
 
-	"github.com/openshift/origin/pkg/user/api"
+	userapi "github.com/openshift/origin/pkg/user/apis/user"
 	"github.com/openshift/origin/pkg/user/registry/identity"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -18,19 +19,19 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against identites
 func NewREST(optsGetter restoptions.Getter) (*REST, error) {
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.Identity{} },
-		NewListFunc:       func() runtime.Object { return &api.IdentityList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &userapi.Identity{} },
+		NewListFunc:       func() runtime.Object { return &userapi.IdentityList{} },
 		PredicateFunc:     identity.Matcher,
-		QualifiedResource: api.Resource("identities"),
+		QualifiedResource: userapi.Resource("identities"),
 
 		CreateStrategy: identity.Strategy,
 		UpdateStrategy: identity.Strategy,
+		DeleteStrategy: identity.Strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: identity.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: identity.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, err
 	}
 

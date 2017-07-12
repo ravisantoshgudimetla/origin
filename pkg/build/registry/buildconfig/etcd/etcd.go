@@ -1,11 +1,12 @@
 package etcd
 
 import (
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapi "k8s.io/kubernetes/pkg/api"
 
-	"github.com/openshift/origin/pkg/build/api"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/build/registry/buildconfig"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -17,20 +18,19 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against BuildConfig.
 func NewREST(optsGetter restoptions.Getter) (*REST, error) {
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.BuildConfig{} },
-		NewListFunc:       func() runtime.Object { return &api.BuildConfigList{} },
-		QualifiedResource: api.Resource("buildconfigs"),
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &buildapi.BuildConfig{} },
+		NewListFunc:       func() runtime.Object { return &buildapi.BuildConfigList{} },
+		QualifiedResource: buildapi.Resource("buildconfigs"),
 		PredicateFunc:     buildconfig.Matcher,
 
-		CreateStrategy: buildconfig.Strategy,
-		UpdateStrategy: buildconfig.Strategy,
-		DeleteStrategy: buildconfig.Strategy,
+		CreateStrategy: buildconfig.GroupStrategy,
+		UpdateStrategy: buildconfig.GroupStrategy,
+		DeleteStrategy: buildconfig.GroupStrategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: buildconfig.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: buildconfig.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, err
 	}
 

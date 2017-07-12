@@ -129,7 +129,7 @@ os::cmd::expect_success 'oc env -n default dc/docker-registry REGISTRY_MIDDLEWAR
 os::cmd::expect_success 'oc rollout status dc/docker-registry'
 os::log::info "Restore configured to enable mirroring"
 
-registry_pod="$(oc get pod -n default -l deploymentconfig=docker-registry --template='{{(index .items 0).metadata.name}}')"
+registry_pod="$(oc get pod -n default -l deploymentconfig=docker-registry --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{end}}{{end}}')"
 
 # Client setup (log in as e2e-user and set 'test' as the default project)
 # This is required to be able to push to the registry!
@@ -201,11 +201,13 @@ os::log::info "Docker registry successfuly refused manifest with missing depende
 
 os::cmd::expect_success 'oc project cache'
 
+IMAGE_PREFIX="${OS_IMAGE_PREFIX:-"openshift/origin"}"
+
 os::log::info "Docker registry start with GCS"
-os::cmd::expect_failure_and_text "docker run -e REGISTRY_STORAGE=\"gcs: {}\" openshift/origin-docker-registry:${TAG}" "No bucket parameter provided"
+os::cmd::expect_failure_and_text "docker run -e REGISTRY_STORAGE=\"gcs: {}\" ${IMAGE_PREFIX}-docker-registry:${TAG}" "No bucket parameter provided"
 
 os::log::info "Docker registry start with OSS"
-os::cmd::expect_failure_and_text "docker run -e REGISTRY_STORAGE=\"oss: {}\" openshift/origin-docker-registry:${TAG}" "No accesskeyid parameter provided"
+os::cmd::expect_failure_and_text "docker run -e REGISTRY_STORAGE=\"oss: {}\" ${IMAGE_PREFIX}-docker-registry:${TAG}" "No accesskeyid parameter provided"
 
 os::log::info "Docker pull from istag"
 os::cmd::expect_success "oc import-image --confirm --from=hello-world:latest -n test hello-world:pullthrough"
@@ -376,30 +378,19 @@ os::cmd::expect_success 'oc login -u e2e-user'
 os::cmd::expect_success 'oc project test'
 os::cmd::expect_success 'oc whoami'
 
-if [[ -n "${SOLTYSH_DEBUG:-}" ]]; then
-    os::log::info "Running a CLI command in a container using the service account"
-    os::cmd::expect_success 'oc policy add-role-to-user view -z default'
-    os::cmd::try_until_success "oc sa get-token default"
-    oc run cli-with-token --attach --image="openshift/origin:${TAG}" --restart=Never -- cli status --loglevel=4 > "${LOG_DIR}/cli-with-token.log" 2>&1
-    # TODO remove set +o errexit, once https://github.com/openshift/origin/issues/12558 gets proper fix
-    set +o errexit
-    os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token.log'" 'Using in-cluster configuration'
-    os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token.log'" 'In project test'
-    set -o errexit
-    os::cmd::expect_success 'oc delete pod cli-with-token'
-    oc run cli-with-token-2 --attach --image="openshift/origin:${TAG}" --restart=Never -- cli whoami --loglevel=4 > "${LOG_DIR}/cli-with-token2.log" 2>&1
-    # TODO remove set +o errexit, once https://github.com/openshift/origin/issues/12558 gets proper fix
-    set +o errexit
-    os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token2.log'" 'system:serviceaccount:test:default'
-    set -o errexit
-    os::cmd::expect_success 'oc delete pod cli-with-token-2'
-    oc run kubectl-with-token --attach --image="openshift/origin:${TAG}" --restart=Never --command -- kubectl get pods --loglevel=4 > "${LOG_DIR}/kubectl-with-token.log" 2>&1
-    # TODO remove set +o errexit, once https://github.com/openshift/origin/issues/12558 gets proper fix
-    set +o errexit
-    os::cmd::expect_success_and_text "cat '${LOG_DIR}/kubectl-with-token.log'" 'Using in-cluster configuration'
-    os::cmd::expect_success_and_text "cat '${LOG_DIR}/kubectl-with-token.log'" 'kubectl-with-token'
-    set -o errexit
-fi
+os::log::info "Running a CLI command in a container using the service account"
+os::cmd::expect_success 'oc policy add-role-to-user view -z default'
+os::cmd::try_until_success "oc sa get-token default"
+oc run cli-with-token --attach --image="${IMAGE_PREFIX}:${TAG}" --restart=Never -- cli status --loglevel=4 > "${LOG_DIR}/cli-with-token.log" 2>&1
+os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token.log'" 'Using in-cluster configuration'
+os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token.log'" 'In project test'
+os::cmd::expect_success 'oc delete pod cli-with-token'
+oc run cli-with-token-2 --attach --image="${IMAGE_PREFIX}:${TAG}" --restart=Never -- cli whoami --loglevel=4 > "${LOG_DIR}/cli-with-token2.log" 2>&1
+os::cmd::expect_success_and_text "cat '${LOG_DIR}/cli-with-token2.log'" 'system:serviceaccount:test:default'
+os::cmd::expect_success 'oc delete pod cli-with-token-2'
+oc run kubectl-with-token --attach --image="${IMAGE_PREFIX}:${TAG}" --restart=Never --command -- kubectl get pods --loglevel=4 > "${LOG_DIR}/kubectl-with-token.log" 2>&1
+os::cmd::expect_success_and_text "cat '${LOG_DIR}/kubectl-with-token.log'" 'Using in-cluster configuration'
+os::cmd::expect_success_and_text "cat '${LOG_DIR}/kubectl-with-token.log'" 'kubectl-with-token'
 
 os::log::info "Testing deployment logs and failing pre and mid hooks ..."
 # test hook selectors
@@ -434,7 +425,10 @@ os::cmd::expect_success_and_text 'oc logs --previous dc/failing-dc-mid'  'test m
 
 os::log::info "Run pod diagnostics"
 # Requires a node to run the origin-deployer pod; expects registry deployed, deployer image pulled
-os::cmd::expect_success_and_text 'oadm diagnostics DiagnosticPod --images='"'""${USE_IMAGES}""'" 'Running diagnostic: PodCheckDns'
+# TODO: Find out why this would flake expecting PodCheckDns to run
+# https://github.com/openshift/origin/issues/9888
+#os::cmd::expect_success_and_text 'oadm diagnostics DiagnosticPod --images='"'""${USE_IMAGES}""'" 'Running diagnostic: PodCheckDns'
+os::cmd::expect_success_and_not_text "oadm diagnostics DiagnosticPod --images='${USE_IMAGES}'" ERROR
 
 os::log::info "Applying STI application config"
 os::cmd::expect_success "oc create -f ${STI_CONFIG_FILE}"
@@ -469,16 +463,16 @@ os::log::info "Validating exec"
 frontend_pod=$(oc get pod -l deploymentconfig=frontend --template='{{(index .items 0).metadata.name}}')
 # when running as a restricted pod the registry will run with a pre-allocated
 # user in the neighborhood of 1000000+.  Look for a substring of the pre-allocated uid range
-os::cmd::expect_success_and_text "oc exec -p ${frontend_pod} id" '1000'
+os::cmd::expect_success_and_text "oc exec ${frontend_pod} id" '1000'
 os::cmd::expect_success_and_text "oc rsh pod/${frontend_pod} id -u" '1000'
 os::cmd::expect_success_and_text "oc rsh -T ${frontend_pod} id -u" '1000'
 
 # test that rsh inherits the TERM variable by default
 # this must be done as an echo and not an argument to rsh because rsh only sets the TERM if
 # no arguments are supplied.
-TERM=test_terminal os::cmd::expect_success_and_text "echo 'echo $TERM' | oc rsh ${frontend_pod}" $TERM
+os::cmd::expect_success_and_text "echo 'echo \$TERM' | TERM=test_terminal oc rsh ${frontend_pod}" test_terminal
 # and does not inherit it when the user provides a command.
-TERM=test_terminal os::cmd::expect_success_and_not_text "oc rsh ${frontend_pod} echo \$TERM" $TERM
+os::cmd::expect_success_and_not_text "TERM=test_terminal oc rsh ${frontend_pod} echo '\$TERM'" test_terminal
 
 # Wait for the rollout to finish
 os::cmd::expect_success "oc rollout status dc/frontend --revision=1"
@@ -547,6 +541,11 @@ os::cmd::expect_success "oc create route edge --service=frontend --cert=${MASTER
                                               --ca-cert=${MASTER_CONFIG_DIR}/ca.crt                 \
                                               --hostname=www.example.com -n test"
 os::cmd::try_until_text "curl -s -k --resolve 'www.example.com:443:${CONTAINER_ACCESSIBLE_API_HOST}' https://www.example.com" "Hello from OpenShift" "$((10*TIME_SEC))"
+# Ensure mixedcase requests work properly for edge/reencrypt routes (SNI-enabled)
+os::cmd::try_until_text "curl -s -k --resolve 'www.example.com:443:${CONTAINER_ACCESSIBLE_API_HOST}' https://wWw.ExAmPlE.cOm" "Hello from OpenShift" "$((10*TIME_SEC))"
+# Ensure mixedcase requests work properly for edge/reencrypt routes (SNI-disabled)
+os::cmd::try_until_text "curl -s -k -H 'Host: wWw.ExAmPlE.cOm' https://${CONTAINER_ACCESSIBLE_API_HOST}" "Hello from OpenShift" "$((10*TIME_SEC))"
+# TODO: Ensure mixedcase requests work properly for passthrough routes
 
 # Pod node selection
 os::log::info "Validating pod.spec.nodeSelector rejections"
@@ -581,7 +580,7 @@ os::cmd::expect_success "docker tag ${GCR_PAUSE_IMAGE} ${DOCKER_REGISTRY}/cache/
 os::cmd::expect_success "docker push ${DOCKER_REGISTRY}/cache/prune"
 
 # record the storage before pruning
-registry_pod=$(oc get pod -n default -l deploymentconfig=docker-registry --template='{{(index .items 0).metadata.name}}')
+registry_pod="$(oc get pod -n default -l deploymentconfig=docker-registry --template '{{range .items}}{{if not .metadata.metadata.deletionTimestamp}}{{.metadata.name}}{{end}}{{end}}')"
 os::cmd::expect_success "oc exec -p ${registry_pod} du /registry > '${LOG_DIR}/prune-images.before.txt'"
 
 # set up pruner user

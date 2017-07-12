@@ -7,11 +7,11 @@ import (
 	"mime"
 	"net/http"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
 
 	"github.com/golang/glog"
-	"github.com/openshift/origin/pkg/build/api"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/build/webhook"
 )
 
@@ -24,10 +24,10 @@ func New() *WebHook {
 }
 
 type commit struct {
-	ID        string                `json:"id,omitempty"`
-	Author    api.SourceControlUser `json:"author,omitempty"`
-	Committer api.SourceControlUser `json:"committer,omitempty"`
-	Message   string                `json:"message,omitempty"`
+	ID        string                     `json:"id,omitempty"`
+	Author    buildapi.SourceControlUser `json:"author,omitempty"`
+	Committer buildapi.SourceControlUser `json:"committer,omitempty"`
+	Message   string                     `json:"message,omitempty"`
 }
 
 type pushEvent struct {
@@ -37,8 +37,8 @@ type pushEvent struct {
 }
 
 // Extract services webhooks from github.com
-func (p *WebHook) Extract(buildCfg *api.BuildConfig, secret, path string, req *http.Request) (revision *api.SourceRevision, envvars []kapi.EnvVar, dockerStrategyOptions *api.DockerStrategyOptions, proceed bool, err error) {
-	triggers, err := webhook.FindTriggerPolicy(api.GitHubWebHookBuildTriggerType, buildCfg)
+func (p *WebHook) Extract(buildCfg *buildapi.BuildConfig, secret, path string, req *http.Request) (revision *buildapi.SourceRevision, envvars []kapi.EnvVar, dockerStrategyOptions *buildapi.DockerStrategyOptions, proceed bool, err error) {
+	triggers, err := webhook.FindTriggerPolicy(buildapi.GitHubWebHookBuildTriggerType, buildCfg)
 	if err != nil {
 		return revision, envvars, dockerStrategyOptions, proceed, err
 	}
@@ -53,8 +53,8 @@ func (p *WebHook) Extract(buildCfg *api.BuildConfig, secret, path string, req *h
 		return revision, envvars, dockerStrategyOptions, proceed, err
 	}
 	method := getEvent(req.Header)
-	if method != "ping" && method != "push" && method != "Push Hook" {
-		return revision, envvars, dockerStrategyOptions, proceed, errors.NewBadRequest(fmt.Sprintf("Unknown X-GitHub-Event, X-Gogs-Event or X-Gitlab-Event %s", method))
+	if method != "ping" && method != "push" {
+		return revision, envvars, dockerStrategyOptions, proceed, errors.NewBadRequest(fmt.Sprintf("Unknown X-GitHub-Event or X-Gogs-Event %s", method))
 	}
 	if method == "ping" {
 		return revision, envvars, dockerStrategyOptions, proceed, err
@@ -72,8 +72,8 @@ func (p *WebHook) Extract(buildCfg *api.BuildConfig, secret, path string, req *h
 		return revision, envvars, dockerStrategyOptions, proceed, err
 	}
 
-	revision = &api.SourceRevision{
-		Git: &api.GitSourceRevision{
+	revision = &buildapi.SourceRevision{
+		Git: &buildapi.GitSourceRevision{
 			Commit:    event.HeadCommit.ID,
 			Author:    event.HeadCommit.Author,
 			Committer: event.HeadCommit.Committer,
@@ -96,7 +96,7 @@ func verifyRequest(req *http.Request) error {
 		return errors.NewBadRequest(fmt.Sprintf("unsupported Content-Type %s", contentType))
 	}
 	if len(getEvent(req.Header)) == 0 {
-		return errors.NewBadRequest("missing X-GitHub-Event, X-Gogs-Event or X-Gitlab-Event")
+		return errors.NewBadRequest("missing X-GitHub-Event or X-Gogs-Event")
 	}
 	return nil
 }
@@ -105,9 +105,6 @@ func getEvent(header http.Header) string {
 	event := header.Get("X-GitHub-Event")
 	if len(event) == 0 {
 		event = header.Get("X-Gogs-Event")
-	}
-	if len(event) == 0 {
-		event = header.Get("X-Gitlab-Event")
 	}
 	return event
 }

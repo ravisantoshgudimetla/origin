@@ -20,7 +20,7 @@ import (
 	kapi "k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/validation"
 
-	buildapi "github.com/openshift/origin/pkg/build/api"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/generate"
 	"github.com/openshift/origin/pkg/generate/git"
 	"github.com/openshift/origin/pkg/generate/source"
@@ -79,7 +79,15 @@ func IsRemoteRepository(s string) (bool, error) {
 	}
 	url.Fragment = ""
 	gitRepo := git.NewRepository()
-	if _, _, err := gitRepo.ListRemote(url.String()); err != nil {
+
+	// try up to 3 times to reach the remote git repo
+	for i := 0; i < 3; i++ {
+		_, _, err = gitRepo.ListRemote(url.String())
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
 		glog.V(5).Infof("could not list git remotes for %s: %v", s, err)
 		return false, err
 	}
@@ -258,6 +266,9 @@ func (r *SourceRepository) LocalPath() (string, error) {
 		if err != nil {
 			return "", err
 		}
+	}
+	if _, err := os.Stat(r.localDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("supplied context directory '%s' does not exist in '%s'", r.contextDir, r.url.String())
 	}
 	return r.localDir, nil
 }
@@ -590,7 +601,10 @@ func CloneAndCheckoutSources(repo git.Repository, remote, ref, localDir, context
 	}
 	if len(ref) > 0 {
 		if err := repo.Checkout(localDir, ref); err != nil {
-			return "", fmt.Errorf("unable to checkout ref %q in %q repository: %v", ref, remote, err)
+			err = repo.PotentialPRRetryAsFetch(localDir, remote, ref, err)
+			if err != nil {
+				return "", fmt.Errorf("unable to checkout ref %q in %q repository: %v", ref, remote, err)
+			}
 		}
 	}
 	if len(contextDir) > 0 {

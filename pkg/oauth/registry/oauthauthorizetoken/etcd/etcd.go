@@ -1,11 +1,12 @@
 package etcd
 
 import (
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapi "k8s.io/kubernetes/pkg/api"
 
-	"github.com/openshift/origin/pkg/oauth/api"
+	oauthapi "github.com/openshift/origin/pkg/oauth/apis/oauth"
 	"github.com/openshift/origin/pkg/oauth/registry/oauthauthorizetoken"
 	"github.com/openshift/origin/pkg/oauth/registry/oauthclient"
 	"github.com/openshift/origin/pkg/util/restoptions"
@@ -20,25 +21,25 @@ type REST struct {
 func NewREST(optsGetter restoptions.Getter, clientGetter oauthclient.Getter) (*REST, error) {
 	strategy := oauthauthorizetoken.NewStrategy(clientGetter)
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.OAuthAuthorizeToken{} },
-		NewListFunc:       func() runtime.Object { return &api.OAuthAuthorizeTokenList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &oauthapi.OAuthAuthorizeToken{} },
+		NewListFunc:       func() runtime.Object { return &oauthapi.OAuthAuthorizeTokenList{} },
 		PredicateFunc:     oauthauthorizetoken.Matcher,
-		QualifiedResource: api.Resource("oauthauthorizetokens"),
+		QualifiedResource: oauthapi.Resource("oauthauthorizetokens"),
 
 		TTLFunc: func(obj runtime.Object, existing uint64, update bool) (uint64, error) {
-			token := obj.(*api.OAuthAuthorizeToken)
+			token := obj.(*oauthapi.OAuthAuthorizeToken)
 			expires := uint64(token.ExpiresIn)
 			return expires, nil
 		},
 
 		CreateStrategy: strategy,
 		UpdateStrategy: strategy,
+		DeleteStrategy: strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: oauthauthorizetoken.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: oauthauthorizetoken.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, err
 	}
 	return &REST{store}, nil

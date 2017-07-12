@@ -62,6 +62,8 @@ const (
 	RegistryViewerRoleName = "registry-viewer"
 	RegistryEditorRoleName = "registry-editor"
 
+	TemplateServiceBrokerClientRoleName = "system:openshift:templateservicebroker-client"
+
 	BuildStrategyDockerRoleName          = "system:build-strategy-docker"
 	BuildStrategyCustomRoleName          = "system:build-strategy-custom"
 	BuildStrategySourceRoleName          = "system:build-strategy-source"

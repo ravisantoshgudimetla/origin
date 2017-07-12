@@ -68,7 +68,6 @@ readonly -f os::util::environment::setup_time_vars
 #  - export VOLUME_DIR
 #  - export ARTIFACT_DIR
 #  - export FAKE_HOME_DIR
-#  - export HOME
 #  - export KUBELET_SCHEME
 #  - export KUBELET_BIND_HOST
 #  - export KUBELET_HOST
@@ -111,7 +110,7 @@ function os::util::environment::update_path_var() {
         prefix+="${GOPATH}/bin:"
     fi
 
-    PATH="${prefix}${PATH}"
+    PATH="${prefix:-}${PATH}"
     export PATH
 }
 readonly -f os::util::environment::update_path_var
@@ -124,24 +123,27 @@ readonly -f os::util::environment::update_path_var
 #  - 1: the path under the root temporary directory for OpenShift where these subdirectories should be made
 # Returns:
 #  - export BASETMPDIR
+#  - export BASEOUTDIR
 #  - export LOG_DIR
 #  - export VOLUME_DIR
 #  - export ARTIFACT_DIR
 #  - export FAKE_HOME_DIR
-#  - export HOME
 #  - export OS_TMP_ENV_SET
 function os::util::environment::setup_tmpdir_vars() {
     local sub_dir=$1
 
     BASETMPDIR="${TMPDIR:-/tmp}/openshift/${sub_dir}"
     export BASETMPDIR
-    LOG_DIR="${LOG_DIR:-${BASETMPDIR}/logs}"
-    export LOG_DIR
     VOLUME_DIR="${BASETMPDIR}/volumes"
     export VOLUME_DIR
-    ARTIFACT_DIR="${ARTIFACT_DIR:-${BASETMPDIR}/artifacts}"
+
+    BASEOUTDIR="${OS_OUTPUT_SCRIPTPATH}/${sub_dir}"
+    export BASEOUTDIR
+    LOG_DIR="${LOG_DIR:-${BASEOUTDIR}/logs}"
+    export LOG_DIR
+    ARTIFACT_DIR="${ARTIFACT_DIR:-${BASEOUTDIR}/artifacts}"
     export ARTIFACT_DIR
-    FAKE_HOME_DIR="${BASETMPDIR}/openshift.local.home"
+    FAKE_HOME_DIR="${BASEOUTDIR}/openshift.local.home"
     export FAKE_HOME_DIR
 
     mkdir -p "${LOG_DIR}" "${VOLUME_DIR}" "${ARTIFACT_DIR}" "${FAKE_HOME_DIR}"
@@ -282,7 +284,6 @@ function os::util::environment::setup_images_vars() {
             export USE_IMAGES
         fi
     fi
-	export OPENSHIFT_ROUTER_IMAGE="$( component=haproxy-router eval "echo ${USE_IMAGES}" )"
 	export MAX_IMAGES_BULK_IMPORTED_PER_REPOSITORY="${MAX_IMAGES_BULK_IMPORTED_PER_REPOSITORY:-3}"
 }
 readonly -f os::util::environment::setup_images_vars

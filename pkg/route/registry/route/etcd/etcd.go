@@ -1,14 +1,16 @@
 package etcd
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	kapirest "k8s.io/apiserver/pkg/registry/rest"
 	kapi "k8s.io/kubernetes/pkg/api"
-	kapirest "k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
 
 	"github.com/openshift/origin/pkg/route"
-	"github.com/openshift/origin/pkg/route/api"
+	routeapi "github.com/openshift/origin/pkg/route/apis/route"
 	rest "github.com/openshift/origin/pkg/route/registry/route"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -18,23 +20,23 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against routes.
-func NewREST(optsGetter restoptions.Getter, allocator route.RouteAllocator) (*REST, *StatusREST, error) {
-	strategy := rest.NewStrategy(allocator)
+func NewREST(optsGetter restoptions.Getter, allocator route.RouteAllocator, sarClient rest.SubjectAccessReviewInterface) (*REST, *StatusREST, error) {
+	strategy := rest.NewStrategy(allocator, sarClient)
 
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.Route{} },
-		NewListFunc:       func() runtime.Object { return &api.RouteList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &routeapi.Route{} },
+		NewListFunc:       func() runtime.Object { return &routeapi.RouteList{} },
 		PredicateFunc:     rest.Matcher,
-		QualifiedResource: api.Resource("routes"),
+		QualifiedResource: routeapi.Resource("routes"),
 
 		CreateStrategy: strategy,
 		UpdateStrategy: strategy,
+		DeleteStrategy: strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: rest.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: rest.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, nil, err
 	}
 
@@ -54,15 +56,15 @@ var _ = kapirest.Patcher(&StatusREST{})
 
 // New creates a new route resource
 func (r *StatusREST) New() runtime.Object {
-	return &api.Route{}
+	return &routeapi.Route{}
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx kapi.Context, name string) (runtime.Object, error) {
-	return r.store.Get(ctx, name)
+func (r *StatusREST) Get(ctx apirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
 }
 
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx kapi.Context, name string, objInfo kapirest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+func (r *StatusREST) Update(ctx apirequest.Context, name string, objInfo kapirest.UpdatedObjectInfo) (runtime.Object, bool, error) {
 	return r.store.Update(ctx, name, objInfo)
 }

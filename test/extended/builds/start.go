@@ -7,12 +7,13 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/util/wait"
-
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 
-	buildapi "github.com/openshift/origin/pkg/build/api"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	exutil "github.com/openshift/origin/test/extended/util"
 )
 
@@ -20,6 +21,7 @@ var _ = g.Describe("[builds][Slow] starting a build using CLI", func() {
 	defer g.GinkgoRecover()
 	var (
 		buildFixture      = exutil.FixturePath("testdata", "test-build.json")
+		bcWithPRRef       = exutil.FixturePath("testdata", "test-bc-with-pr-ref.yaml")
 		exampleGemfile    = exutil.FixturePath("testdata", "test-build-app", "Gemfile")
 		exampleBuild      = exutil.FixturePath("testdata", "test-build-app")
 		exampleGemfileURL = "https://raw.githubusercontent.com/openshift/ruby-hello-world/master/Gemfile"
@@ -49,6 +51,31 @@ var _ = g.Describe("[builds][Slow] starting a build using CLI", func() {
 			o.Expect(br.StartBuildErr).To(o.HaveOccurred()) // start-build should detect the build error with --wait flag
 			o.Expect(br.StartBuildStdErr).Should(o.ContainSubstring(`status is "Failed"`))
 		})
+	})
+
+	g.Describe("oc start-build with pr ref", func() {
+		g.It("should start a build from a PR ref, wait for the build to complete, and confirm the right level was used", func() {
+			g.By("make sure wildly imagestream has latest tag")
+			err := exutil.WaitForAnImageStreamTag(oc.AsAdmin(), "openshift", "wildfly", "latest")
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("create build config")
+			err = oc.Run("create").Args("-f", bcWithPRRef).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("start the build, wait for and confirm successful completion")
+			br, err := exutil.StartBuildAndWait(oc, "bc-with-pr-ref")
+			o.Expect(err).NotTo(o.HaveOccurred())
+			br.AssertSuccess()
+			out, err := br.Logs()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// the repo at the PR level noted in bcWithPRRef had a pom.xml level of "0.1-SNAPSHOT" (we are well past that now)
+			// so simply looking for that string in the mvn output is indicative of being at that level
+			g.By("confirm the correct commit level was retrieved")
+			o.Expect(strings.Contains(out, "0.1-SNAPSHOT")).To(o.BeTrue())
+		})
+
 	})
 
 	g.Describe("override environment", func() {
@@ -216,10 +243,11 @@ var _ = g.Describe("[builds][Slow] starting a build using CLI", func() {
 			err := exutil.WaitForABuild(oc.Client().Builds(oc.Namespace()), "sample-build-binary-invalidnodeselector-1", nil, nil, cancelFn)
 			o.Expect(err).NotTo(o.HaveOccurred())
 			o.Expect(build.Status.Phase).To(o.Equal(buildapi.BuildPhaseCancelled))
+			exutil.CheckForBuildEvent(oc.KubeClient().Core(), build, buildapi.BuildCancelledEventReason, buildapi.BuildCancelledEventMessage)
 		})
 	})
 
-	g.Describe("cancelling build started by oc start-build --wait", func() {
+	g.Describe("cancel a build started by oc start-build --wait", func() {
 		g.It("should start a build and wait for the build to cancel", func() {
 			g.By("starting the build with --wait flag")
 			var wg sync.WaitGroup
@@ -247,11 +275,16 @@ var _ = g.Describe("[builds][Slow] starting a build using CLI", func() {
 			})
 
 			o.Expect(buildName).ToNot(o.BeEmpty())
+			build, err := oc.Client().Builds(oc.Namespace()).Get(buildName, metav1.GetOptions{})
+			o.Expect(err).NotTo(o.HaveOccurred())
+			o.Expect(build).NotTo(o.BeNil(), "build object should exist")
 
 			g.By(fmt.Sprintf("cancelling the build %q", buildName))
-			err := oc.Run("cancel-build").Args(buildName).Execute()
+			err = oc.Run("cancel-build").Args(buildName).Execute()
 			o.Expect(err).ToNot(o.HaveOccurred())
 			wg.Wait()
+			exutil.CheckForBuildEvent(oc.KubeClient().Core(), build, buildapi.BuildCancelledEventReason, buildapi.BuildCancelledEventMessage)
+
 		})
 
 	})
@@ -283,6 +316,26 @@ var _ = g.Describe("[builds][Slow] starting a build using CLI", func() {
 			o.Expect(err).NotTo(o.HaveOccurred())
 			g.By("verifying the build failed due to Docker.")
 			o.Expect(buildLog).To(o.ContainSubstring("One or more build-args [bar] were not consumed, failing build"))
+		})
+	})
+
+	g.Describe("Trigger builds with branch refs matching directories on master branch", func() {
+
+		g.It("Should checkout the config branch, not config directory", func() {
+			g.By("calling oc new-app")
+			_, err := oc.Run("new-app").Args("https://github.com/openshift/ruby-hello-world#config").Output()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("waiting for the build to complete")
+			err = exutil.WaitForABuild(oc.Client().Builds(oc.Namespace()), "ruby-hello-world-1", nil, nil, nil)
+			if err != nil {
+				exutil.DumpBuildLogs("ruby-hello-world", oc)
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build logs, confirm commit in the config branch is present")
+			out, err := oc.Run("logs").Args("build/ruby-hello-world-1").Output()
+			o.Expect(out).To(o.ContainSubstring("Merge pull request #61 from gabemontero/config"))
 		})
 	})
 })

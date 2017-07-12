@@ -13,11 +13,13 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	knet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kapi "k8s.io/kubernetes/pkg/api"
-	knet "k8s.io/kubernetes/pkg/util/net"
 
-	build "github.com/openshift/origin/pkg/build/api"
-	buildv1 "github.com/openshift/origin/pkg/build/api/v1"
+	build "github.com/openshift/origin/pkg/build/apis/build"
+	buildv1 "github.com/openshift/origin/pkg/build/apis/build/v1"
 	testutil "github.com/openshift/origin/test/util"
 	testserver "github.com/openshift/origin/test/util/server"
 )
@@ -32,8 +34,10 @@ var expectedIndex = []string{
 	"/apis/apps.openshift.io/v1",
 	"/apis/apps/v1beta1",
 	"/apis/authentication.k8s.io",
+	"/apis/authentication.k8s.io/v1",
 	"/apis/authentication.k8s.io/v1beta1",
 	"/apis/authorization.k8s.io",
+	"/apis/authorization.k8s.io/v1",
 	"/apis/authorization.k8s.io/v1beta1",
 	"/apis/authorization.openshift.io",
 	"/apis/authorization.openshift.io/v1",
@@ -45,12 +49,10 @@ var expectedIndex = []string{
 	"/apis/build.openshift.io",
 	"/apis/build.openshift.io/v1",
 	"/apis/certificates.k8s.io",
-	"/apis/certificates.k8s.io/v1alpha1",
+	"/apis/certificates.k8s.io/v1beta1",
 	"/apis/extensions",
 	"/apis/extensions/v1beta1",
 	"/apis/image.openshift.io",
-	"/apis/image.openshift.io/1.0",
-	"/apis/image.openshift.io/pre012",
 	"/apis/image.openshift.io/v1",
 	"/apis/network.openshift.io",
 	"/apis/network.openshift.io/v1",
@@ -62,11 +64,14 @@ var expectedIndex = []string{
 	"/apis/project.openshift.io/v1",
 	"/apis/quota.openshift.io",
 	"/apis/quota.openshift.io/v1",
+	"/apis/rbac.authorization.k8s.io",
+	"/apis/rbac.authorization.k8s.io/v1beta1",
 	"/apis/route.openshift.io",
 	"/apis/route.openshift.io/v1",
 	"/apis/security.openshift.io",
 	"/apis/security.openshift.io/v1",
 	"/apis/storage.k8s.io",
+	"/apis/storage.k8s.io/v1",
 	"/apis/storage.k8s.io/v1beta1",
 	"/apis/template.openshift.io",
 	"/apis/template.openshift.io/v1",
@@ -77,13 +82,12 @@ var expectedIndex = []string{
 	"/healthz/ping",
 	"/healthz/poststarthook/bootstrap-controller",
 	"/healthz/poststarthook/ca-registration",
-	"/healthz/poststarthook/extensions/third-party-resources",
+	// "/healthz/poststarthook/extensions/third-party-resources",  // Do not enable this controller, we do not support it
 	"/healthz/ready",
 	"/metrics",
 	"/oapi",
 	"/oapi/v1",
-	"/osapi",
-	"/swaggerapi/",
+	"/swaggerapi",
 	"/version",
 	"/version/openshift",
 }
@@ -204,6 +208,78 @@ func TestWellKnownOAuthOff(t *testing.T) {
 	}
 }
 
+var preferredVersions = map[string]string{
+	"":                          "v1",
+	"apps":                      "v1beta1",
+	"authentication.k8s.io":     "v1",
+	"authorization.k8s.io":      "v1",
+	"autoscaling":               "v1",
+	"batch":                     "v1",
+	"certificates.k8s.io":       "v1beta1",
+	"extensions":                "v1beta1",
+	"policy":                    "v1beta1",
+	"rbac.authorization.k8s.io": "v1beta1",
+	"storage.k8s.io":            "v1",
+
+	"apps.openshift.io":          "v1",
+	"authorization.openshift.io": "v1",
+	"build.openshift.io":         "v1",
+	"image.openshift.io":         "v1",
+	"network.openshift.io":       "v1",
+	"oauth.openshift.io":         "v1",
+	"project.openshift.io":       "v1",
+	"quota.openshift.io":         "v1",
+	"route.openshift.io":         "v1",
+	"security.openshift.io":      "v1",
+	"template.openshift.io":      "v1",
+	"user.openshift.io":          "v1",
+}
+
+func TestApiGroupPreferredVersions(t *testing.T) {
+	testutil.RequireEtcd(t)
+	defer testutil.DumpEtcdOnFailure(t)
+	masterConfig, err := testserver.DefaultMasterOptions()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	masterConfig.OAuthConfig = nil
+	clusterAdminKubeConfig, err := testserver.StartConfiguredMasterAPI(masterConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	kclientset, err := testutil.GetClusterAdminKubeClient(clusterAdminKubeConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	t.Logf("Looking for build api group in server group discovery")
+	groups, err := kclientset.Discovery().ServerGroups()
+	if err != nil {
+		t.Fatalf("unexpected group discovery error: %v", err)
+	}
+
+	found := sets.NewString()
+	for _, g := range groups.Groups {
+		found.Insert(g.Name)
+		preferred, found := preferredVersions[g.Name]
+		if !found {
+			t.Errorf("Unexpected group %q in discovery", g.Name)
+			continue
+		}
+
+		if g.PreferredVersion.Version != preferred {
+			t.Errorf("Unexpected preferred version for group %q: got %q, expected %q", g.Name, g.PreferredVersion.Version, preferred)
+		}
+	}
+
+	for g := range preferredVersions {
+		if !found.Has(g) {
+			t.Errorf("Didn't see group %q in discovery", g)
+		}
+	}
+}
+
 func TestApiGroups(t *testing.T) {
 	testutil.RequireEtcd(t)
 	defer testutil.DumpEtcdOnFailure(t)
@@ -272,7 +348,7 @@ func TestApiGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer kclientset.Namespaces().Delete(ns, &kapi.DeleteOptions{})
+	defer kclientset.Core().Namespaces().Delete(ns, &metav1.DeleteOptions{})
 
 	t.Logf("GETting builds")
 	req, err := http.NewRequest("GET", masterConfig.AssetConfig.MasterPublicURL+fmt.Sprintf("/apis/%s/%s", buildv1.GroupName, buildv1.SchemeGroupVersion.Version), nil)
@@ -312,7 +388,7 @@ func TestApiGroups(t *testing.T) {
 	}
 	respBuild, ok := respObj.(*buildv1.Build)
 	if !ok {
-		t.Fatalf("Unexpected type %t, expected buildv1.Build", respObj)
+		t.Fatalf("Unexpected type %T, expected buildv1.Build", respObj)
 	}
 	if got, expected := respBuild.APIVersion, buildv1.SchemeGroupVersion.String(); got != expected {
 		t.Fatalf("Unexpected APIVersion: got=%q, expected=%q", got, expected)
@@ -341,7 +417,7 @@ func anonymousHttpTransport(clusterAdminKubeConfig string) (*http.Transport, err
 
 func testBuild() *build.Build {
 	return &build.Build{
-		ObjectMeta: kapi.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
 		Spec: build.BuildSpec{

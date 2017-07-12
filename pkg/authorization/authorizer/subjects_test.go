@@ -3,10 +3,10 @@ package authorizer
 import (
 	"testing"
 
-	kauthorizer "k8s.io/kubernetes/pkg/auth/authorizer"
-	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/sets"
+	kauthorizer "k8s.io/apiserver/pkg/authorization/authorizer"
 
-	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	testpolicyregistry "github.com/openshift/origin/pkg/authorization/registry/test"
 	"github.com/openshift/origin/pkg/authorization/rulevalidation"
 )
@@ -34,7 +34,26 @@ func TestSubjects(t *testing.T) {
 			Verb:            "get",
 			Resource:        "pods",
 		},
-		expectedUsers:  sets.NewString("Anna", "ClusterAdmin", "Ellen", "Valerie", "system:serviceaccount:adze:second", "system:serviceaccount:foo:default", "system:serviceaccount:other:first", "system:admin"),
+		expectedUsers: sets.NewString("Anna", "ClusterAdmin", "Ellen", "Valerie",
+			"system:serviceaccount:adze:second",
+			"system:serviceaccount:foo:default",
+			"system:serviceaccount:other:first",
+			"system:serviceaccount:kube-system:deployment-controller",
+			"system:serviceaccount:kube-system:endpoint-controller",
+			"system:serviceaccount:kube-system:generic-garbage-collector",
+			"system:serviceaccount:kube-system:namespace-controller",
+			"system:serviceaccount:kube-system:persistent-volume-binder",
+			"system:serviceaccount:kube-system:statefulset-controller",
+			"system:admin",
+			"system:kube-scheduler",
+			"system:serviceaccount:openshift-infra:build-controller",
+			"system:serviceaccount:openshift-infra:deployer-controller",
+			"system:serviceaccount:openshift-infra:template-instance-controller",
+			"system:serviceaccount:openshift-infra:template-instance-controller",
+			"system:serviceaccount:openshift-infra:build-controller",
+			"system:serviceaccount:openshift-infra:pv-recycler-controller",
+			"system:serviceaccount:openshift-infra:sdn-controller",
+		),
 		expectedGroups: sets.NewString("RootUsers", "system:cluster-admins", "system:cluster-readers", "system:masters", "system:nodes"),
 	}
 	test.clusterPolicies = newDefaultClusterPolicies()

@@ -10,21 +10,23 @@ import (
 	"strings"
 	"time"
 
+	dockerfileparser "github.com/docker/docker/builder/dockerfile/parser"
 	"github.com/fsouza/go-dockerclient"
 	"github.com/golang/glog"
+
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	kutilerrors "k8s.io/apimachinery/pkg/util/errors"
 	kapi "k8s.io/kubernetes/pkg/api"
-	kerrors "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/meta"
 	"k8s.io/kubernetes/pkg/api/validation"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
-	kutilerrors "k8s.io/kubernetes/pkg/util/errors"
 
-	dockerfileparser "github.com/docker/docker/builder/dockerfile/parser"
 	ometa "github.com/openshift/origin/pkg/api/meta"
-	authapi "github.com/openshift/origin/pkg/authorization/api"
-	buildapi "github.com/openshift/origin/pkg/build/api"
+	authapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	buildutil "github.com/openshift/origin/pkg/build/util"
 	"github.com/openshift/origin/pkg/client"
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
@@ -34,7 +36,7 @@ import (
 	"github.com/openshift/origin/pkg/generate/dockerfile"
 	"github.com/openshift/origin/pkg/generate/jenkinsfile"
 	"github.com/openshift/origin/pkg/generate/source"
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	outil "github.com/openshift/origin/pkg/util"
 	dockerfileutil "github.com/openshift/origin/pkg/util/docker/dockerfile"
 )
@@ -355,7 +357,7 @@ func validateOutputImageReference(ref string) error {
 }
 
 // buildPipelines converts a set of resolved, valid references into pipelines.
-func (c *AppConfig) buildPipelines(components app.ComponentReferences, environment app.Environment) (app.PipelineGroup, error) {
+func (c *AppConfig) buildPipelines(components app.ComponentReferences, environment app.Environment, buildEnvironment app.Environment) (app.PipelineGroup, error) {
 	pipelines := app.PipelineGroup{}
 
 	buildArgs, err := cmdutil.ParseBuildArg(c.BuildArgs, c.In)
@@ -372,7 +374,7 @@ func (c *AppConfig) buildPipelines(components app.ComponentReferences, environme
 
 	numDockerBuilds := 0
 
-	pipelineBuilder := app.NewPipelineBuilder(c.Name, c.GetBuildEnvironment(), DockerStrategyOptions, c.OutputDocker).To(c.To)
+	pipelineBuilder := app.NewPipelineBuilder(c.Name, buildEnvironment, DockerStrategyOptions, c.OutputDocker).To(c.To)
 	for _, group := range components.Group() {
 		glog.V(4).Infof("found group: %v", group)
 		common := app.PipelineGroup{}
@@ -464,13 +466,16 @@ func (c *AppConfig) buildPipelines(components app.ComponentReferences, environme
 }
 
 // buildTemplates converts a set of resolved, valid references into references to template objects.
-func (c *AppConfig) buildTemplates(components app.ComponentReferences, parameters app.Environment, environment app.Environment) (string, []runtime.Object, error) {
+func (c *AppConfig) buildTemplates(components app.ComponentReferences, parameters app.Environment, environment app.Environment, buildEnvironment app.Environment) (string, []runtime.Object, error) {
 	objects := []runtime.Object{}
 	name := ""
 	for _, ref := range components {
 		tpl := ref.Input().ResolvedMatch.Template
 
 		glog.V(4).Infof("processing template %s/%s", c.OriginNamespace, tpl.Name)
+		if len(c.ContextDir) > 0 {
+			return "", nil, fmt.Errorf("--context-dir is not supported when using a template")
+		}
 		result, err := TransformTemplate(tpl, c.OSClient, c.OriginNamespace, parameters)
 		if err != nil {
 			return name, nil, err
@@ -483,6 +488,12 @@ func (c *AppConfig) buildTemplates(components app.ComponentReferences, parameter
 			// if environment variables were passed in, let's apply the environment variables
 			// to every pod template object
 			for i := range result.Objects {
+				switch result.Objects[i].(type) {
+				case *buildapi.BuildConfig:
+					buildEnv := buildutil.GetBuildConfigEnv(result.Objects[i].(*buildapi.BuildConfig))
+					buildEnv = app.JoinEnvironment(buildEnv, buildEnvironment.List())
+					buildutil.SetBuildConfigEnv(result.Objects[i].(*buildapi.BuildConfig), buildEnv)
+				}
 				podSpec, _, err := ometa.GetPodSpec(result.Objects[i])
 				if err == nil {
 					for ii := range podSpec.Containers {
@@ -570,14 +581,14 @@ func (c *AppConfig) installComponents(components app.ComponentReferences, env ap
 
 	serviceAccountName := "installer"
 	if token != nil && token.ServiceAccount {
-		if _, err := c.KubeClient.Core().ServiceAccounts(c.OriginNamespace).Get(serviceAccountName); err != nil {
+		if _, err := c.KubeClient.Core().ServiceAccounts(c.OriginNamespace).Get(serviceAccountName, metav1.GetOptions{}); err != nil {
 			if kerrors.IsNotFound(err) {
 				objects = append(objects,
 					// create a new service account
-					&kapi.ServiceAccount{ObjectMeta: kapi.ObjectMeta{Name: serviceAccountName}},
+					&kapi.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: serviceAccountName}},
 					// grant the service account the edit role on the project (TODO: installer)
 					&authapi.RoleBinding{
-						ObjectMeta: kapi.ObjectMeta{Name: "installer-role-binding"},
+						ObjectMeta: metav1.ObjectMeta{Name: "installer-role-binding"},
 						Subjects:   []kapi.ObjectReference{{Kind: "ServiceAccount", Name: serviceAccountName}},
 						RoleRef:    kapi.ObjectReference{Name: "edit"},
 					},
@@ -723,7 +734,8 @@ func (c *AppConfig) validate() (app.Environment, app.Environment, app.Environmen
 
 // Run executes the provided config to generate objects.
 func (c *AppConfig) Run() (*AppResult, error) {
-	env, _, parameters, err := c.validate()
+	env, buildenv, parameters, err := c.validate()
+
 	if err != nil {
 		return nil, err
 	}
@@ -784,7 +796,7 @@ func (c *AppConfig) Run() (*AppResult, error) {
 		}, nil
 	}
 
-	pipelines, err := c.buildPipelines(components.ImageComponentRefs(), env)
+	pipelines, err := c.buildPipelines(components.ImageComponentRefs(), env, buildenv)
 	if err != nil {
 		return nil, err
 	}
@@ -802,7 +814,7 @@ func (c *AppConfig) Run() (*AppResult, error) {
 
 	objects = app.AddServices(objects, false)
 
-	templateName, templateObjects, err := c.buildTemplates(components.TemplateComponentRefs(), parameters, env)
+	templateName, templateObjects, err := c.buildTemplates(components.TemplateComponentRefs(), parameters, env, buildenv)
 	if err != nil {
 		return nil, err
 	}
@@ -950,7 +962,7 @@ func (c *AppConfig) followRefToDockerImage(ref *kapi.ObjectReference, isContext 
 
 		if isContext == nil {
 			var err error
-			isContext, err = c.OSClient.ImageStreams(isNS).Get(isName)
+			isContext, err = c.OSClient.ImageStreams(isNS).Get(isName, metav1.GetOptions{})
 			if err != nil {
 				return nil, fmt.Errorf("Unable to check for circular build input/outputs: %v", err)
 			}
@@ -1047,12 +1059,6 @@ func (c *AppConfig) HasArguments() bool {
 		len(c.DockerImages) > 0 ||
 		len(c.Templates) > 0 ||
 		len(c.TemplateFiles) > 0
-}
-
-func (c *AppConfig) GetBuildEnvironment() app.Environment {
-	_, buildEnv, _, _ := c.validate()
-	return buildEnv
-
 }
 
 func optionallyValidateExposedPorts(config *AppConfig, repositories app.SourceRepositories) error {

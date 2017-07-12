@@ -8,16 +8,23 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
+	dockertypes "github.com/docker/engine-api/types"
 	docker "github.com/fsouza/go-dockerclient"
-	"k8s.io/kubernetes/pkg/util/interrupt"
-	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	"github.com/openshift/source-to-image/pkg/tar"
+	s2iutil "github.com/openshift/source-to-image/pkg/util"
 
+	"k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/util/interrupt"
+
+	"github.com/openshift/imagebuilder"
+	"github.com/openshift/imagebuilder/dockerclient"
 	"github.com/openshift/imagebuilder/imageprogress"
 )
 
@@ -93,7 +100,7 @@ func RetryImageAction(client DockerClient, opts interface{}, authConfig docker.A
 		time.Sleep(DefaultPushOrPullRetryDelay)
 	}
 
-	return fmt.Errorf("After retrying %d times, %s image still failed", DefaultPushOrPullRetryDelay, actionName)
+	return fmt.Errorf("After retrying %d times, %s image still failed", DefaultPushOrPullRetryCount, actionName)
 }
 
 func pullImage(client DockerClient, name string, authConfig docker.AuthConfiguration) error {
@@ -171,6 +178,91 @@ func buildImage(client DockerClient, dir string, tar tar.Tar, opts *docker.Build
 	return client.BuildImage(*opts)
 }
 
+// buildDirectImage invokes a docker build on a particular directory using imagebuilder
+func buildDirectImage(dir string, ignoreFailures bool, opts *docker.BuildImageOptions) error {
+	glog.V(5).Infof("Invoking imagebuilder to create %q in dir %s with Dockerfile %s", opts.Name, dir, opts.Dockerfile)
+
+	e := dockerclient.NewClientExecutor(nil)
+	e.Directory = dir
+	e.Tag = opts.Name
+
+	e.IgnoreUnrecognizedInstructions = ignoreFailures
+	e.StrictVolumeOwnership = !ignoreFailures
+	e.HostConfig = &docker.HostConfig{
+		NetworkMode: opts.NetworkMode,
+		CPUShares:   opts.CPUShares,
+		CPUPeriod:   opts.CPUPeriod,
+		CPUSetCPUs:  opts.CPUSetCPUs,
+		CPUQuota:    opts.CPUQuota,
+		Memory:      opts.Memory,
+		MemorySwap:  opts.Memswap,
+	}
+
+	e.Out, e.ErrOut = opts.OutputStream, opts.OutputStream
+
+	// use a keyring
+	keys := make(credentialprovider.DockerConfig)
+	for k, v := range opts.AuthConfigs.Configs {
+		keys[k] = credentialprovider.DockerConfigEntry{
+			Username: v.Username,
+			Password: v.Password,
+			Email:    v.Email,
+		}
+	}
+	keyring := credentialprovider.BasicDockerKeyring{}
+	keyring.Add(keys)
+	e.AuthFn = func(name string) ([]dockertypes.AuthConfig, bool) {
+		authConfs, found := keyring.Lookup(name)
+		var out []dockertypes.AuthConfig
+		for _, conf := range authConfs {
+			out = append(out, conf.AuthConfig)
+		}
+		return out, found
+	}
+
+	e.LogFn = func(format string, args ...interface{}) {
+		if glog.Is(3) {
+			glog.Infof("Builder: "+format, args...)
+		} else {
+			fmt.Fprintf(e.ErrOut, "--> %s\n", fmt.Sprintf(format, args...))
+		}
+	}
+
+	arguments := make(map[string]string)
+	for _, arg := range opts.BuildArgs {
+		arguments[arg.Name] = arg.Value
+	}
+
+	if err := e.DefaultExcludes(); err != nil {
+		return fmt.Errorf("error: Could not parse default .dockerignore: %v", err)
+	}
+
+	client, err := dockerclient.NewClientFromEnv()
+	if err != nil {
+		return fmt.Errorf("error: No connection to Docker available: %v", err)
+	}
+	e.Client = client
+
+	releaseFn := func() {
+		for _, err := range e.Release() {
+			fmt.Fprintf(e.ErrOut, "error: Unable to clean up build: %v\n", err)
+		}
+	}
+	return interrupt.New(nil, releaseFn).Run(func() error {
+		b, node, err := imagebuilder.NewBuilderForFile(filepath.Join(dir, opts.Dockerfile), arguments)
+		if err != nil {
+			return err
+		}
+		if err := e.Prepare(b, node); err != nil {
+			return err
+		}
+		if err := e.Execute(b, node); err != nil {
+			return err
+		}
+		return e.Commit(b)
+	})
+}
+
 // tagImage uses the dockerClient to tag a Docker image with name. It is a
 // helper to facilitate the usage of dockerClient.TagImage, because the former
 // requires the name to be split into more explicit parts.
@@ -191,7 +283,12 @@ func tagImage(dockerClient DockerClient, image, name string) error {
 // removed after it terminates.
 func dockerRun(client DockerClient, createOpts docker.CreateContainerOptions, attachOpts docker.AttachToContainerOptions) error {
 	// Create a new container.
-	glog.V(4).Infof("Creating container with options {Name:%q Config:%+v HostConfig:%+v} ...", createOpts.Name, createOpts.Config, createOpts.HostConfig)
+	// First strip any inlined proxy credentials from the *proxy* env variables,
+	// before logging the env variables.
+	if glog.Is(4) {
+		redactedOpts := SafeForLoggingDockerCreateOptions(&createOpts)
+		glog.V(4).Infof("Creating container with options {Name:%q Config:%+v HostConfig:%+v} ...", redactedOpts.Name, redactedOpts.Config, redactedOpts.HostConfig)
+	}
 	c, err := client.CreateContainer(createOpts)
 	if err != nil {
 		return fmt.Errorf("create container %q: %v", createOpts.Name, err)
@@ -392,4 +489,24 @@ func GetDockerClient() (client *docker.Client, endpoint string, err error) {
 		endpoint = "unix:///var/run/docker.sock"
 	}
 	return
+}
+
+// SafeForLoggingDockerConfig returns a copy of a docker config struct
+// where any proxy credentials in the env section of the config
+// have been redacted.
+func SafeForLoggingDockerConfig(config *docker.Config) *docker.Config {
+	origEnv := config.Env
+	newConfig := *config
+	newConfig.Env = s2iutil.SafeForLoggingEnv(origEnv)
+	return &newConfig
+}
+
+// SafeForLoggingDockerCreateOptions returns a copy of a docker
+// create container options struct where any proxy credentials in the env section of
+// the config have been redacted.
+func SafeForLoggingDockerCreateOptions(opts *docker.CreateContainerOptions) *docker.CreateContainerOptions {
+	origConfig := opts.Config
+	newOpts := *opts
+	newOpts.Config = SafeForLoggingDockerConfig(origConfig)
+	return &newOpts
 }

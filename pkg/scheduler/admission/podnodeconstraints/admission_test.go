@@ -5,31 +5,32 @@ import (
 	"fmt"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/admission"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
-	"k8s.io/kubernetes/pkg/auth/authorizer"
-	"k8s.io/kubernetes/pkg/auth/user"
-	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 
 	_ "github.com/openshift/origin/pkg/api/install"
-	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 	oadmission "github.com/openshift/origin/pkg/cmd/server/admission"
-	deployapi "github.com/openshift/origin/pkg/deploy/api"
+	deployapi "github.com/openshift/origin/pkg/deploy/apis/apps"
 	"github.com/openshift/origin/pkg/scheduler/admission/podnodeconstraints/api"
-	securityapi "github.com/openshift/origin/pkg/security/api"
+	securityapi "github.com/openshift/origin/pkg/security/apis/security"
 )
 
 func TestPodNodeConstraints(t *testing.T) {
-	ns := kapi.NamespaceDefault
+	ns := metav1.NamespaceDefault
 	tests := []struct {
 		config           *api.PodNodeConstraintsConfig
 		resource         runtime.Object
-		kind             unversioned.GroupKind
-		groupresource    unversioned.GroupResource
+		kind             schema.GroupKind
+		groupresource    schema.GroupResource
 		userinfo         user.Info
 		reviewResponse   *authorizationapi.SubjectAccessReviewResponse
 		expectedResource string
@@ -119,7 +120,7 @@ func TestPodNodeConstraints(t *testing.T) {
 }
 
 func TestPodNodeConstraintsPodUpdate(t *testing.T) {
-	ns := kapi.NamespaceDefault
+	ns := metav1.NamespaceDefault
 	var expectedError error
 	errPrefix := "PodUpdate"
 	prc := NewPodNodeConstraints(testConfig())
@@ -135,7 +136,7 @@ func TestPodNodeConstraintsPodUpdate(t *testing.T) {
 }
 
 func TestPodNodeConstraintsNonHandledResources(t *testing.T) {
-	ns := kapi.NamespaceDefault
+	ns := metav1.NamespaceDefault
 	errPrefix := "ResourceQuotaTest"
 	var expectedError error
 	prc := NewPodNodeConstraints(testConfig())
@@ -151,7 +152,7 @@ func TestPodNodeConstraintsNonHandledResources(t *testing.T) {
 }
 
 func TestPodNodeConstraintsResources(t *testing.T) {
-	ns := kapi.NamespaceDefault
+	ns := metav1.NamespaceDefault
 	testconfigs := []struct {
 		config         *api.PodNodeConstraintsConfig
 		userinfo       user.Info
@@ -165,8 +166,8 @@ func TestPodNodeConstraintsResources(t *testing.T) {
 	}
 	testresources := []struct {
 		resource      func(bool) runtime.Object
-		kind          unversioned.GroupKind
-		groupresource unversioned.GroupResource
+		kind          schema.GroupKind
+		groupresource schema.GroupResource
 		prefix        string
 	}{
 		{

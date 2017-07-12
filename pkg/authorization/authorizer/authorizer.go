@@ -3,9 +3,9 @@ package authorizer
 import (
 	"errors"
 
-	"k8s.io/kubernetes/pkg/auth/authorizer"
-	kerrors "k8s.io/kubernetes/pkg/util/errors"
-	"k8s.io/kubernetes/pkg/util/sets"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 
 	"github.com/openshift/origin/pkg/authorization/rulevalidation"
 )
@@ -33,7 +33,7 @@ func (a *openshiftAuthorizer) Authorize(attributes authorizer.Attributes) (bool,
 		return false, "", err
 	}
 
-	denyReason, err := a.forbiddenMessageMaker.MakeMessage(MessageContext{attributes})
+	denyReason, err := a.forbiddenMessageMaker.MakeMessage(attributes)
 	if err != nil {
 		denyReason = err.Error()
 	}

@@ -3,14 +3,14 @@ package etcd
 import (
 	"testing"
 
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	etcdtesting "k8s.io/apiserver/pkg/storage/etcd/testing"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
-	etcdtesting "k8s.io/kubernetes/pkg/storage/etcd/testing"
 
-	"github.com/openshift/origin/pkg/template/api"
-	_ "github.com/openshift/origin/pkg/template/api/install"
+	templateapi "github.com/openshift/origin/pkg/template/apis/template"
+	_ "github.com/openshift/origin/pkg/template/apis/template/install"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
 
@@ -23,9 +23,9 @@ func newStorage(t *testing.T) (*REST, *etcdtesting.EtcdTestServer) {
 	return storage, server
 }
 
-func validTemplate() *api.Template {
-	return &api.Template{
-		ObjectMeta: kapi.ObjectMeta{
+func validTemplate() *templateapi.Template {
+	return &templateapi.Template{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "foo",
 		},
 	}
@@ -42,7 +42,7 @@ func TestCreate(t *testing.T) {
 	test.TestCreate(
 		valid,
 		// invalid
-		&api.Template{},
+		&templateapi.Template{},
 	)
 }
 

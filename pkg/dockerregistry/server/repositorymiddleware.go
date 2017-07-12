@@ -15,13 +15,15 @@ import (
 	repomw "github.com/docker/distribution/registry/middleware/repository"
 	registrystorage "github.com/docker/distribution/registry/storage"
 
-	kerrors "k8s.io/kubernetes/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	restclient "k8s.io/client-go/rest"
 	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
-	"k8s.io/kubernetes/pkg/client/restclient"
 
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/dockerregistry/server/audit"
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	"github.com/openshift/origin/pkg/dockerregistry/server/metrics"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	quotautil "github.com/openshift/origin/pkg/quota/util"
 )
 
@@ -30,7 +32,12 @@ const (
 
 	// DockerRegistryURLEnvVar is a mandatory environment variable name specifying url of internal docker
 	// registry. All references to pushed images will be prefixed with its value.
+	// DEPRECATED: Use the OPENSHIFT_DEFAULT_REGISTRY instead.
 	DockerRegistryURLEnvVar = "DOCKER_REGISTRY_URL"
+
+	// OpenShiftDefaultRegistry overrides the DockerRegistryURLEnvVar as in OpenShift the
+	// default registry URL is controller by this environment variable.
+	OpenShiftDefaultRegistry = "OPENSHIFT_DEFAULT_REGISTRY"
 
 	// EnforceQuotaEnvVar is a boolean environment variable that allows to turn quota enforcement on or off.
 	// By default, quota enforcement is off. It overrides openshift middleware configuration option.
@@ -103,7 +110,7 @@ func init() {
 				panic(fmt.Sprintf("Configuration error: OpenShift storage driver middleware not activated"))
 			}
 
-			registryOSClient, kClient, errClients := RegistryClientFrom(ctx).Clients()
+			registryOSClient, kCoreClient, errClients := RegistryClientFrom(ctx).Clients()
 			if errClients != nil {
 				return nil, errClients
 			}
@@ -111,12 +118,12 @@ func init() {
 				quotaEnforcing = newQuotaEnforcingConfig(ctx, os.Getenv(EnforceQuotaEnvVar), os.Getenv(ProjectCacheTTLEnvVar), options)
 			}
 
-			return newRepositoryWithClient(ctx, registryOSClient, kClient.Core(), kClient.Core(), repo, options)
+			return newRepositoryWithClient(ctx, registryOSClient, kCoreClient, repo, options)
 		},
 	)
 
 	secureTransport = http.DefaultTransport
-	insecureTransport, err = restclient.TransportFor(&restclient.Config{Insecure: true})
+	insecureTransport, err = restclient.TransportFor(&restclient.Config{TLSClientConfig: restclient.TLSClientConfig{Insecure: true}})
 	if err != nil {
 		panic(fmt.Sprintf("Unable to configure a default transport for importing insecure images: %v", err))
 	}
@@ -128,7 +135,6 @@ type repository struct {
 	distribution.Repository
 
 	ctx              context.Context
-	quotaClient      kcoreclient.ResourceQuotasGetter
 	limitClient      kcoreclient.LimitRangesGetter
 	registryOSClient client.Interface
 	registryAddr     string
@@ -160,17 +166,29 @@ type repository struct {
 func newRepositoryWithClient(
 	ctx context.Context,
 	registryOSClient client.Interface,
-	quotaClient kcoreclient.ResourceQuotasGetter,
 	limitClient kcoreclient.LimitRangesGetter,
 	repo distribution.Repository,
 	options map[string]interface{},
 ) (distribution.Repository, error) {
+	// TODO: Deprecate this environment variable.
 	registryAddr := os.Getenv(DockerRegistryURLEnvVar)
 	if len(registryAddr) == 0 {
-		return nil, fmt.Errorf("%s is required", DockerRegistryURLEnvVar)
+		registryAddr = os.Getenv(OpenShiftDefaultRegistry)
+	} else {
+		context.GetLogger(ctx).Infof("DEPRECATED: %q is deprecated, use the %q instead", DockerRegistryURLEnvVar, OpenShiftDefaultRegistry)
 	}
+	// TODO: This is a fallback to assuming there is a service named 'docker-registry'. This
+	// might change in the future and we should make this configurable.
+	if len(registryAddr) == 0 {
+		if len(os.Getenv("DOCKER_REGISTRY_SERVICE_HOST")) > 0 && len(os.Getenv("DOCKER_REGISTRY_SERVICE_PORT")) > 0 {
+			registryAddr = os.Getenv("DOCKER_REGISTRY_SERVICE_HOST") + ":" + os.Getenv("DOCKER_REGISTRY_SERVICE_PORT")
+		} else {
+			return nil, fmt.Errorf("%s variable must be set when running outside of Kubernetes cluster", DockerRegistryURLEnvVar)
+		}
+	}
+	context.GetLogger(ctx).Infof("Using %q as Docker Registry URL", registryAddr)
 
-	acceptschema2, err := getBoolOption(AcceptSchema2EnvVar, "acceptschema2", false, options)
+	acceptschema2, err := getBoolOption(AcceptSchema2EnvVar, "acceptschema2", true, options)
 	if err != nil {
 		context.GetLogger(ctx).Error(err)
 	}
@@ -204,7 +222,6 @@ func newRepositoryWithClient(
 		Repository: repo,
 
 		ctx:                    ctx,
-		quotaClient:            quotaClient,
 		limitClient:            limitClient,
 		registryOSClient:       registryOSClient,
 		registryAddr:           registryAddr,
@@ -262,8 +279,15 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 	}
 
 	if audit.LoggerExists(ctx) {
-		ms = &auditManifestService{
-			manifests: ms,
+		ms = audit.NewManifestService(ctx, ms)
+	}
+
+	config := ConfigurationFrom(ctx)
+
+	if config.Metrics.Enabled {
+		ms = &metrics.ManifestService{
+			Manifests: ms,
+			Reponame:  r.Named().Name(),
 		}
 	}
 
@@ -274,7 +298,7 @@ func (r *repository) Manifests(ctx context.Context, options ...distribution.Mani
 func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 	bs := r.Repository.Blobs(ctx)
 
-	if !quotaEnforcing.enforcementDisabled {
+	if quotaEnforcing.enforcementEnabled {
 		bs = &quotaRestrictedBlobStore{
 			BlobStore: bs,
 
@@ -297,8 +321,15 @@ func (r *repository) Blobs(ctx context.Context) distribution.BlobStore {
 	}
 
 	if audit.LoggerExists(ctx) {
-		bs = &auditBlobStore{
-			store: bs,
+		bs = audit.NewBlobStore(ctx, bs)
+	}
+
+	config := ConfigurationFrom(ctx)
+
+	if config.Metrics.Enabled {
+		bs = &metrics.BlobStore{
+			Store:    bs,
+			Reponame: r.Named().Name(),
 		}
 	}
 
@@ -320,8 +351,15 @@ func (r *repository) Tags(ctx context.Context) distribution.TagService {
 	}
 
 	if audit.LoggerExists(ctx) {
-		ts = &auditTagService{
-			tags: ts,
+		ts = audit.NewTagService(ctx, ts)
+	}
+
+	config := ConfigurationFrom(ctx)
+
+	if config.Metrics.Enabled {
+		ts = &metrics.TagService{
+			Tags:     ts,
+			Reponame: r.Named().Name(),
 		}
 	}
 
@@ -364,7 +402,7 @@ func (r *repository) getImage(dgst digest.Digest) (*imageapi.Image, error) {
 		return image, nil
 	}
 
-	image, err := r.registryOSClient.Images().Get(dgst.String())
+	image, err := r.registryOSClient.Images().Get(dgst.String(), metav1.GetOptions{})
 	if err != nil {
 		context.GetLogger(r.ctx).Errorf("failed to get image: %v", err)
 		return nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
@@ -375,28 +413,53 @@ func (r *repository) getImage(dgst digest.Digest) (*imageapi.Image, error) {
 	return image, nil
 }
 
-// getImageOfImageStream retrieves the Image with digest `dgst` for the ImageStream associated with r. This
-// ensures the image belongs to the image stream. It uses two queries to master API:
+// getStoredImageOfImageStream retrieves the Image with digest `dgst` and
+// ensures that the image belongs to the ImageStream associated with r. It
+// uses two queries to master API:
+//
 //  1st to get a corresponding image stream
 //  2nd to get the image
+//
 // This allows us to cache the image stream for later use.
-func (r *repository) getImageOfImageStream(dgst digest.Digest) (*imageapi.Image, *imageapi.ImageStream, error) {
+//
+// If you need the image object to be modified according to image stream tag,
+// please use getImageOfImageStream.
+func (r *repository) getStoredImageOfImageStream(dgst digest.Digest) (*imageapi.Image, *imageapi.TagEvent, *imageapi.ImageStream, error) {
 	stream, err := r.imageStreamGetter.get()
 	if err != nil {
 		context.GetLogger(r.ctx).Errorf("failed to get ImageStream: %v", err)
-		return nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
+		return nil, nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
 	}
 
-	_, err = imageapi.ResolveImageID(stream, dgst.String())
+	tagEvent, err := imageapi.ResolveImageID(stream, dgst.String())
 	if err != nil {
 		context.GetLogger(r.ctx).Errorf("failed to resolve image %s in ImageStream %s/%s: %v", dgst.String(), r.namespace, r.name, err)
-		return nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
+		return nil, nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
 	}
 
 	image, err := r.getImage(dgst)
 	if err != nil {
-		return nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
+		return nil, nil, nil, wrapKStatusErrorOnGetImage(r.name, dgst, err)
 	}
+
+	return image, tagEvent, stream, nil
+}
+
+// getImageOfImageStream retrieves the Image with digest `dgst` for
+// the ImageStream associated with r. The image's field DockerImageReference
+// is modified on the fly to pretend that we've got the image from the source
+// from which the image was tagged.to match tag's DockerImageReference.
+//
+// NOTE: due to on the fly modification, the returned image object should
+// not be sent to the master API. If you need unmodified version of the
+// image object, please use getStoredImageOfImageStream.
+func (r *repository) getImageOfImageStream(dgst digest.Digest) (*imageapi.Image, *imageapi.ImageStream, error) {
+	image, tagEvent, stream, err := r.getStoredImageOfImageStream(dgst)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	image.DockerImageReference = tagEvent.DockerImageReference
 
 	return image, stream, nil
 }

@@ -3,9 +3,9 @@ package rulevalidation
 import (
 	"strings"
 
-	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
 )
 
 // Covers determines whether or not the ownerRules cover the servantRules in terms of allowed actions.

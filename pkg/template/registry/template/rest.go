@@ -5,13 +5,14 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 
 	"github.com/openshift/origin/pkg/template"
-	"github.com/openshift/origin/pkg/template/api"
-	templatevalidation "github.com/openshift/origin/pkg/template/api/validation"
+	templateapi "github.com/openshift/origin/pkg/template/apis/template"
+	templatevalidation "github.com/openshift/origin/pkg/template/apis/template/validation"
 	"github.com/openshift/origin/pkg/template/generator"
 )
 
@@ -30,17 +31,17 @@ func NewREST() *REST {
 // a rest.Storage object to vary its output or input types (not sure whether New()
 // should be input or output... probably input).
 func (s *REST) New() runtime.Object {
-	return &api.Template{}
+	return &templateapi.Template{}
 }
 
 // Create processes a Template and creates a new list of objects
-func (s *REST) Create(ctx kapi.Context, obj runtime.Object) (runtime.Object, error) {
-	tpl, ok := obj.(*api.Template)
+func (s *REST) Create(ctx apirequest.Context, obj runtime.Object) (runtime.Object, error) {
+	tpl, ok := obj.(*templateapi.Template)
 	if !ok {
 		return nil, errors.NewBadRequest("not a template")
 	}
 	if errs := templatevalidation.ValidateProcessedTemplate(tpl); len(errs) > 0 {
-		return nil, errors.NewInvalid(api.Kind("Template"), tpl.Name, errs)
+		return nil, errors.NewInvalid(templateapi.Kind("Template"), tpl.Name, errs)
 	}
 
 	generators := map[string]generator.Generator{
@@ -49,14 +50,14 @@ func (s *REST) Create(ctx kapi.Context, obj runtime.Object) (runtime.Object, err
 	processor := template.NewProcessor(generators)
 	if errs := processor.Process(tpl); len(errs) > 0 {
 		glog.V(1).Infof(errs.ToAggregate().Error())
-		return nil, errors.NewInvalid(api.Kind("Template"), tpl.Name, errs)
+		return nil, errors.NewInvalid(templateapi.Kind("Template"), tpl.Name, errs)
 	}
 
 	// we know that we get back runtime.Unstructured objects from the Process call.  We need to encode those
 	// objects using the unstructured codec BEFORE the REST layers gets its shot at encoding to avoid a layered
 	// encode being done.
 	for i := range tpl.Objects {
-		tpl.Objects[i] = runtime.NewEncodable(runtime.UnstructuredJSONScheme, tpl.Objects[i])
+		tpl.Objects[i] = runtime.NewEncodable(unstructured.UnstructuredJSONScheme, tpl.Objects[i])
 	}
 
 	return tpl, nil

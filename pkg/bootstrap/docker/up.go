@@ -13,16 +13,17 @@ import (
 	"github.com/blang/semver"
 	"github.com/docker/docker/cliconfig"
 	dockerclient "github.com/docker/engine-api/client"
-	docker "github.com/fsouza/go-dockerclient"
+	"github.com/docker/engine-api/types/versions"
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	kerrors "k8s.io/kubernetes/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	kclientcmd "k8s.io/client-go/tools/clientcmd"
 	kclientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	kclientcmd "k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/openshift/origin/pkg/bootstrap/docker/dockerhelper"
 	"github.com/openshift/origin/pkg/bootstrap/docker/dockermachine"
@@ -35,15 +36,12 @@ import (
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
 	osclientcmd "github.com/openshift/origin/pkg/cmd/util/clientcmd"
-	dockerutil "github.com/openshift/origin/pkg/cmd/util/docker"
 	"github.com/openshift/origin/pkg/cmd/util/variable"
 )
 
 const (
 	// CmdUpRecommendedName is the recommended command name
 	CmdUpRecommendedName = "up"
-
-	openshiftNamespace = "openshift"
 
 	initialUser     = "developer"
 	initialPassword = "developer"
@@ -54,6 +52,8 @@ const (
 
 	defaultRedirectClient  = "openshift-web-console"
 	developmentRedirectURI = "https://localhost:9000"
+
+	dockerAPIVersion122 = "1.22"
 )
 
 var (
@@ -62,7 +62,7 @@ var (
 		initial templates, and a default project.
 
 		This command will attempt to use an existing connection to a Docker daemon. Before running
-		the command, ensure that you can execure docker commands successfully (i.e. 'docker ps').
+		the command, ensure that you can execute docker commands successfully (i.e. 'docker ps').
 
 		Optionally, the command can create a new Docker machine for OpenShift using the VirtualBox
 		driver when the --create-machine argument is specified. The machine will be named 'openshift'
@@ -97,8 +97,8 @@ var (
 		"rhel7":   "examples/image-streams/image-streams-rhel7.json",
 	}
 
-	// defaultImageStreams is the default key for the above imageStreams
-	// mapping. It should be set during build via -ldflags.
+	// defaultImageStreams is the default key for the above imageStreams mapping.
+	// It should be set during build via -ldflags.
 	defaultImageStreams string
 
 	templateLocations = map[string]string{
@@ -114,16 +114,23 @@ var (
 		"jenkins pipeline ephemeral":  "examples/jenkins/jenkins-ephemeral-template.json",
 		"jenkins pipeline persistent": "examples/jenkins/jenkins-persistent-template.json",
 		"sample pipeline":             "examples/jenkins/pipeline/samplepipeline.yaml",
-		"logging":                     "examples/logging/logging-deployer.yaml",
+	}
+	// internalTemplateLocations are templates that will be registered in an internal namespace
+	// instead of the openshift namespace.
+	internalTemplateLocations = map[string]string{
+		"logging":         "examples/logging/logging-deployer.yaml",
+		"service catalog": "examples/service-catalog/service-catalog.yaml",
 	}
 	adminTemplateLocations = map[string]string{
 		"prometheus":          "examples/prometheus/prometheus.yaml",
 		"heapster standalone": "examples/heapster/heapster-standalone.yaml",
 	}
-	dockerVersion112 = semver.MustParse("1.12.0")
+
+	openshiftVersion36       = semver.MustParse("3.6.0")
+	openshiftVersion36alpha2 = semver.MustParse("3.6.0-alpha.2+3c221d5")
 )
 
-// NewCmdUp creates a command that starts openshift on Docker with reasonable defaults
+// NewCmdUp creates a command that starts OpenShift on Docker with reasonable defaults
 func NewCmdUp(name, fullName string, f *osclientcmd.Factory, out, errout io.Writer) *cobra.Command {
 	config := &ClientStartConfig{
 		CommonStartConfig: CommonStartConfig{
@@ -162,22 +169,31 @@ type task struct {
 	name      string
 	fn        taskFunc
 	condition conditionFunc
+	stdOut    bool // true if task's output should go directly to stdout
+}
+
+func simpleTask(name string, fn taskFunc) task {
+	return task{name: name, fn: fn}
+}
+
+func conditionalTask(name string, fn taskFunc, condition conditionFunc) task {
+	return task{name: name, fn: fn, condition: condition}
 }
 
 type CommonStartConfig struct {
-	ImageVersion              string
-	Image                     string
-	ImageStreams              string
-	DockerMachine             string
-	ShouldCreateDockerMachine bool
-	SkipRegistryCheck         bool
-	ShouldInstallMetrics      bool
-	ShouldInstallLogging      bool
-	PortForwarding            bool
+	ImageVersion                string
+	Image                       string
+	ImageStreams                string
+	DockerMachine               string
+	ShouldCreateDockerMachine   bool
+	SkipRegistryCheck           bool
+	ShouldInstallMetrics        bool
+	ShouldInstallLogging        bool
+	ShouldInstallServiceCatalog bool
+	PortForwarding              bool
 
-	Out         io.Writer
-	TaskPrinter *TaskPrinter
-	Tasks       []task
+	Out   io.Writer
+	Tasks []task
 
 	HostName                 string
 	LocalConfigDir           string
@@ -200,8 +216,7 @@ type CommonStartConfig struct {
 	NoProxy                  []string
 	CACert                   string
 
-	dockerClient    *docker.Client
-	engineAPIClient *dockerclient.Client
+	dockerClient    dockerhelper.Interface
 	dockerHelper    *dockerhelper.Helper
 	hostHelper      *host.HostHelper
 	openshiftHelper *openshift.Helper
@@ -212,6 +227,7 @@ type CommonStartConfig struct {
 	usingDefaultImages         bool
 	usingDefaultOpenShiftImage bool
 	checkAlternatePorts        bool
+	isRHDocker                 bool
 
 	shouldInitializeData *bool
 	shouldCreateUser     *bool
@@ -219,12 +235,8 @@ type CommonStartConfig struct {
 	containerNetworkErr chan error
 }
 
-func (c *CommonStartConfig) addTask(name string, fn taskFunc) {
-	c.addConditionalTask(name, fn, nil)
-}
-
-func (c *CommonStartConfig) addConditionalTask(name string, fn taskFunc, condition conditionFunc) {
-	c.Tasks = append(c.Tasks, task{name: name, fn: fn, condition: condition})
+func (c *CommonStartConfig) addTask(t task) {
+	c.Tasks = append(c.Tasks, t)
 }
 
 func (config *CommonStartConfig) Bind(flags *pflag.FlagSet) {
@@ -246,6 +258,7 @@ func (config *CommonStartConfig) Bind(flags *pflag.FlagSet) {
 	flags.StringArrayVarP(&config.Environment, "env", "e", config.Environment, "Specify a key-value pair for an environment variable to set on OpenShift container")
 	flags.BoolVar(&config.ShouldInstallMetrics, "metrics", false, "Install metrics (experimental)")
 	flags.BoolVar(&config.ShouldInstallLogging, "logging", false, "Install logging (experimental)")
+	flags.BoolVar(&config.ShouldInstallServiceCatalog, "service-catalog", false, "Install service catalog (experimental).")
 	flags.StringVar(&config.HTTPProxy, "http-proxy", "", "HTTP proxy to use for master and builds")
 	flags.StringVar(&config.HTTPSProxy, "https-proxy", "", "HTTPS proxy to use for master and builds")
 	flags.StringArrayVar(&config.NoProxy, "no-proxy", config.NoProxy, "List of hosts or subnets for which a proxy should not be used")
@@ -261,18 +274,19 @@ func (c *CommonStartConfig) Validate(out io.Writer) error {
 
 // Start runs the start tasks ensuring that they are executed in sequence
 func (c *CommonStartConfig) Start(out io.Writer) error {
+	taskPrinter := NewTaskPrinter(out)
 	for _, task := range c.Tasks {
 		if task.condition != nil && !task.condition() {
 			continue
 		}
-		c.TaskPrinter.StartTask(task.name)
-		w := c.TaskPrinter.TaskWriter()
+		taskPrinter.StartTask(task.name)
+		w := taskPrinter.TaskWriter()
 		err := task.fn(w)
 		if err != nil {
-			c.TaskPrinter.Failure(err)
+			taskPrinter.Failure(err)
 			return err
 		}
-		c.TaskPrinter.Success()
+		taskPrinter.Success()
 	}
 	return nil
 }
@@ -287,7 +301,6 @@ func (config *ClientStartConfig) Bind(flags *pflag.FlagSet) {
 }
 
 func (c *CommonStartConfig) Complete(f *osclientcmd.Factory, cmd *cobra.Command) error {
-	c.TaskPrinter = NewTaskPrinter(c.Out)
 	c.originalFactory = f
 	c.command = cmd
 
@@ -295,42 +308,44 @@ func (c *CommonStartConfig) Complete(f *osclientcmd.Factory, cmd *cobra.Command)
 		c.ImageVersion = defaultImageVersion()
 	}
 
-	c.addTask("Checking OpenShift client", c.CheckOpenShiftClient)
+	c.addTask(simpleTask("Checking OpenShift client", c.CheckOpenShiftClient))
 
-	c.addConditionalTask("Create Docker machine", c.CreateDockerMachine, func() bool { return c.ShouldCreateDockerMachine })
+	c.addTask(conditionalTask("Create Docker machine", c.CreateDockerMachine, func() bool { return c.ShouldCreateDockerMachine }))
 	// Get a Docker client.
-	// If a Docker machine was specified, make sure that the machine is
-	// running. Otherwise, use environment variables.
-	c.addTask("Checking Docker client", c.GetDockerClient)
+	// If a Docker machine was specified, make sure that the machine is running.
+	// Otherwise, use environment variables.
+	c.addTask(simpleTask("Checking Docker client", c.GetDockerClient))
 
 	// Check that we have the minimum Docker version available to run OpenShift
-	c.addTask("Checking Docker version", c.CheckDockerVersion)
+	c.addTask(simpleTask("Checking Docker version", c.CheckDockerVersion))
 
 	// Check for an OpenShift container. If one exists and is running, exit.
 	// If one exists but not running, delete it.
-	c.addTask("Checking for existing OpenShift container", c.CheckExistingOpenShiftContainer)
+	c.addTask(simpleTask("Checking for existing OpenShift container", c.CheckExistingOpenShiftContainer))
 
-	// Ensure that the OpenShift Docker image is available. If not present,
-	// pull it.
-	c.addTask(fmt.Sprintf("Checking for %s image", c.openshiftImage()), c.CheckOpenShiftImage)
+	// Ensure that the OpenShift Docker image is available.
+	// If not present, pull it.
+	t := simpleTask(fmt.Sprintf("Checking for %s image", c.openshiftImage()), c.CheckOpenShiftImage)
+	t.stdOut = true
+	c.addTask(t)
 
-	// Ensure that the Docker daemon has the right --insecure-registry argument. If
-	// not, then exit.
+	// Ensure that the Docker daemon has the right --insecure-registry argument.
+	// If not, then exit.
 	if !c.SkipRegistryCheck {
-		c.addTask("Checking Docker daemon configuration", c.CheckDockerInsecureRegistry)
+		c.addTask(simpleTask("Checking Docker daemon configuration", c.CheckDockerInsecureRegistry))
 	}
 
 	// Ensure that ports used by OpenShift are available on the host machine
-	c.addTask("Checking for available ports", c.CheckAvailablePorts)
+	c.addTask(simpleTask("Checking for available ports", c.CheckAvailablePorts))
 
 	// Check whether the Docker host has the right binaries to use Kubernetes' nsenter mounter
 	// If not, use a shared volume to mount volumes on OpenShift
-	c.addTask("Checking type of volume mount", c.CheckNsenterMounter)
+	c.addTask(simpleTask("Checking type of volume mount", c.CheckNsenterMounter))
 
 	// Ensure that host directories exist.
 	// If not using the nsenter mounter, create a volume share on the host machine to
 	// mount OpenShift volumes.
-	c.addTask("Creating host directories", c.EnsureHostDirectories)
+	c.addTask(simpleTask("Creating host directories", c.EnsureHostDirectories))
 
 	// Determine an IP to use for OpenShift.
 	// The result is that c.ServerIP will be populated with
@@ -348,7 +363,7 @@ func (c *CommonStartConfig) Complete(f *osclientcmd.Factory, cmd *cobra.Command)
 	// included in the server's certificate. These include any IPs that are currently
 	// assigned to the Docker host (hostname -I)
 	// Each IP is tested to ensure that it can be accessed from the current client
-	c.addTask("Finding server IP", c.DetermineServerIP)
+	c.addTask(simpleTask("Finding server IP", c.DetermineServerIP))
 
 	return nil
 }
@@ -359,48 +374,65 @@ func (c *ClientStartConfig) Complete(f *osclientcmd.Factory, cmd *cobra.Command)
 		return err
 	}
 
+	// Check if the openshift server version is sufficient to run the service catalog.
+	// Do this first so we can fail quickly if it's not.
+	c.addTask(conditionalTask("Checking service catalog version requirements", c.CheckServiceCatalogPrereqVersion, func() bool {
+		return c.ShouldInstallServiceCatalog
+	}))
+
 	// Create an OpenShift configuration and start a container that uses it.
-	c.addTask("Starting OpenShift container", c.StartOpenShift)
+	c.addTask(simpleTask("Starting OpenShift container", c.StartOpenShift))
 
 	// Add default redirect URIs to an OAuthClient to enable local web-console development.
-	c.addConditionalTask("Adding default OAuthClient redirect URIs", c.EnsureDefaultRedirectURIs, c.ShouldInitializeData)
+	c.addTask(conditionalTask("Adding default OAuthClient redirect URIs", c.EnsureDefaultRedirectURIs, c.ShouldInitializeData))
 
 	// Install a registry
-	c.addConditionalTask("Installing registry", c.InstallRegistry, c.ShouldInitializeData)
+	c.addTask(conditionalTask("Installing registry", c.InstallRegistry, c.ShouldInitializeData))
 
 	// Install a router
-	c.addConditionalTask("Installing router", c.InstallRouter, c.ShouldInitializeData)
+	c.addTask(conditionalTask("Installing router", c.InstallRouter, c.ShouldInitializeData))
 
 	// Install metrics
-	c.addConditionalTask("Installing metrics", c.InstallMetrics, func() bool {
+	c.addTask(conditionalTask("Installing metrics", c.InstallMetrics, func() bool {
 		return c.ShouldInstallMetrics && c.ShouldInitializeData()
-	})
+	}))
 
 	// Import default image streams
-	c.addConditionalTask("Importing image streams", c.ImportImageStreams, c.ShouldInitializeData)
+	c.addTask(conditionalTask("Importing image streams", c.ImportImageStreams, c.ShouldInitializeData))
 
 	// Import templates
-	c.addConditionalTask("Importing templates", c.ImportTemplates, c.ShouldInitializeData)
+	c.addTask(conditionalTask("Importing templates", c.ImportTemplates, c.ShouldInitializeData))
 
 	// Install logging
-	c.addConditionalTask("Installing logging", c.InstallLogging, func() bool {
+	c.addTask(conditionalTask("Installing logging", c.InstallLogging, func() bool {
 		return c.ShouldInstallLogging && c.ShouldInitializeData()
-	})
+	}))
+
+	// Install service catalog
+	c.addTask(conditionalTask("Installing service catalog", c.InstallServiceCatalog, func() bool {
+		return c.ShouldInstallServiceCatalog && c.ShouldInitializeData()
+	}))
 
 	// Login with an initial default user
-	c.addConditionalTask("Login to server", c.Login, c.ShouldCreateUser)
+	c.addTask(conditionalTask("Login to server", c.Login, c.ShouldCreateUser))
 
 	// Create an initial project
-	c.addConditionalTask(fmt.Sprintf("Creating initial project %q", initialProjectName), c.CreateProject, c.ShouldCreateUser)
+	c.addTask(conditionalTask(fmt.Sprintf("Creating initial project %q", initialProjectName), c.CreateProject, c.ShouldCreateUser))
 
 	// Remove temporary directory
-	c.addTask("Removing temporary directory", c.RemoveTemporaryDirectory)
+	c.addTask(simpleTask("Removing temporary directory", c.RemoveTemporaryDirectory))
 
-	// Check container networking
-	c.addTask("Checking container networking", c.CheckContainerNetworking)
+	// Check container networking (only when loglevel > 0)
+	if glog.V(1) {
+		c.addTask(simpleTask("Checking container networking", c.CheckContainerNetworking))
+	}
 
 	// Display server information
-	c.addTask("Server Information", c.ServerInfo)
+	c.addTask(simpleTask("Server Information", c.ServerInfo))
+
+	c.addTask(conditionalTask("Service Catalog Instructions", c.ServiceCatalogInstructions, func() bool {
+		return c.ShouldInstallServiceCatalog && c.ShouldInitializeData()
+	}))
 
 	return nil
 }
@@ -416,18 +448,47 @@ func (c *ClientStartConfig) Validate(out, errout io.Writer) error {
 
 // Start runs the start tasks ensuring that they are executed in sequence
 func (c *ClientStartConfig) Start(out io.Writer) error {
-	for _, task := range c.Tasks {
-		if task.condition != nil && !task.condition() {
-			continue
+	var detailedOut io.Writer
+
+	// When loglevel > 0, just use stdout to write all messages
+	if glog.V(1) {
+		detailedOut = out
+	} else {
+		fmt.Fprintf(out, "Starting OpenShift using %s ...\n", c.openshiftImage())
+		detailedOut = &bytes.Buffer{}
+	}
+
+	taskPrinter := NewTaskPrinter(detailedOut)
+	startError := func() error {
+		for _, task := range c.Tasks {
+			if task.condition != nil && !task.condition() {
+				continue
+			}
+			taskPrinter.StartTask(task.name)
+			w := taskPrinter.TaskWriter()
+			if task.stdOut && !bool(glog.V(1)) {
+				w = io.MultiWriter(w, out)
+			}
+			err := task.fn(w)
+			if err != nil {
+				taskPrinter.Failure(err)
+				return err
+			}
+			taskPrinter.Success()
 		}
-		c.TaskPrinter.StartTask(task.name)
-		w := c.TaskPrinter.TaskWriter()
-		err := task.fn(w)
-		if err != nil {
-			c.TaskPrinter.Failure(err)
-			return err
+		return nil
+	}()
+	if startError != nil {
+		if !bool(glog.V(1)) {
+			fmt.Fprintf(out, "%s", detailedOut.(*bytes.Buffer).String())
 		}
-		c.TaskPrinter.Success()
+		return startError
+	}
+	if !bool(glog.V(1)) {
+		c.ServerInfo(out)
+		if c.ShouldInstallServiceCatalog {
+			c.ServiceCatalogInstructions(out)
+		}
 	}
 	return nil
 }
@@ -496,24 +557,24 @@ func (c *CommonStartConfig) CheckOpenShiftClient(out io.Writer) error {
 // GetDockerClient obtains a new Docker client from the environment or
 // from a Docker machine, starting it if necessary
 func (c *CommonStartConfig) GetDockerClient(out io.Writer) error {
-	dockerClient, engineAPIClient, err := getDockerClient(out, c.DockerMachine, true)
+	client, err := getDockerClient(out, c.DockerMachine, true)
 	if err != nil {
 		return err
 	}
-	c.dockerClient, c.engineAPIClient = dockerClient, engineAPIClient
+	c.dockerClient = client
 	return nil
 }
 
 // getDockerClient obtains a new Docker client from the environment or
 // from a Docker machine, starting it if necessary and permitted
-func getDockerClient(out io.Writer, dockerMachine string, canStartDockerMachine bool) (*docker.Client, *dockerclient.Client, error) {
+func getDockerClient(out io.Writer, dockerMachine string, canStartDockerMachine bool) (dockerhelper.Interface, error) {
 	if len(dockerMachine) > 0 {
 		glog.V(2).Infof("Getting client for Docker machine %q", dockerMachine)
-		dockerClient, engineAPIClient, err := getDockerMachineClient(dockerMachine, out, canStartDockerMachine)
+		client, err := getDockerMachineClient(dockerMachine, out, canStartDockerMachine)
 		if err != nil {
-			return nil, nil, errors.ErrNoDockerMachineClient(dockerMachine, err)
+			return nil, errors.ErrNoDockerMachineClient(dockerMachine, err)
 		}
-		return dockerClient, engineAPIClient, nil
+		return client, nil
 	}
 
 	dockerTLSVerify := os.Getenv("DOCKER_TLS_VERIFY")
@@ -540,10 +601,6 @@ func getDockerClient(out io.Writer, dockerMachine string, canStartDockerMachine 
 			glog.Infof("DOCKER_CERT_PATH=%s", dockerCertPath)
 		}
 	}
-	dockerClient, _, err := dockerutil.NewHelper().GetClient()
-	if err != nil {
-		return nil, nil, errors.ErrNoDockerClient(err)
-	}
 	// FIXME: Workaround for docker engine API client on OS X - sets the default to
 	// the wrong DOCKER_HOST string
 	if runtime.GOOS == "darwin" {
@@ -552,20 +609,20 @@ func getDockerClient(out io.Writer, dockerMachine string, canStartDockerMachine 
 			os.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 		}
 	}
+	host := os.Getenv("DOCKER_HOST")
+	if len(host) == 0 {
+		host = dockerclient.DefaultDockerHost
+	}
 	engineAPIClient, err := dockerclient.NewEnvClient()
 	if err != nil {
-		return nil, nil, errors.ErrNoDockerClient(err)
+		return nil, errors.ErrNoDockerClient(err)
 	}
-	if err = dockerClient.Ping(); err != nil {
-		return nil, nil, errors.ErrCannotPingDocker(err)
-	}
-	glog.V(4).Infof("Docker ping succeeded")
-	return dockerClient, engineAPIClient, nil
+	return dockerhelper.NewClient(host, engineAPIClient), nil
 }
 
-// CheckExistingOpenShiftContainer checks the state of an OpenShift container. If one
-// is already running, it throws an error. If one exists, it removes it so a new one
-// can be created.
+// CheckExistingOpenShiftContainer checks the state of an OpenShift container.
+// If one is already running, it throws an error.
+// If one exists, it removes it so a new one can be created.
 func (c *CommonStartConfig) CheckExistingOpenShiftContainer(out io.Writer) error {
 	container, running, err := c.DockerHelper().GetContainerState(openshift.OpenShiftContainer)
 	if err != nil {
@@ -584,8 +641,8 @@ func (c *CommonStartConfig) CheckExistingOpenShiftContainer(out io.Writer) error
 	return nil
 }
 
-// CheckOpenShiftImage checks whether the OpenShift image exists. If not it tells the
-// Docker daemon to pull it.
+// CheckOpenShiftImage checks whether the OpenShift image exists.
+// If not it tells the Docker daemon to pull it.
 func (c *CommonStartConfig) CheckOpenShiftImage(out io.Writer) error {
 	return c.DockerHelper().CheckAndPull(c.openshiftImage(), out)
 }
@@ -602,12 +659,12 @@ func (c *CommonStartConfig) CheckDockerInsecureRegistry(out io.Writer) error {
 	return nil
 }
 
-// CheckNsenterMounter checks whether the Docker host can use the nsenter mounter from Kubernetes. Otherwise,
-// a shared volume is needed in Docker
+// CheckNsenterMounter checks whether the Docker host can use the nsenter mounter from Kubernetes.
+// Otherwise, a shared volume is needed in Docker
 func (c *CommonStartConfig) CheckNsenterMounter(out io.Writer) error {
 	var err error
 	c.UseNsenterMount, err = c.HostHelper().CanUseNsenterMounter()
-	if c.UseNsenterMount {
+	if c.UseNsenterMount && c.isRHDocker {
 		fmt.Fprintf(out, "Using nsenter mounter for OpenShift volumes\n")
 	} else {
 		fmt.Fprintf(out, "Using Docker shared volumes for OpenShift volumes\n")
@@ -618,16 +675,17 @@ func (c *CommonStartConfig) CheckNsenterMounter(out io.Writer) error {
 // CheckDockerVersion checks that the appropriate Docker version is installed based on whether we are using the nsenter mounter
 // or shared volumes for OpenShift
 func (c *CommonStartConfig) CheckDockerVersion(out io.Writer) error {
-	ver, _, err := c.DockerHelper().Version()
+	ver, isRHDocker, err := c.DockerHelper().APIVersion()
 	if err != nil {
-		glog.V(1).Infof("Failed to check Docker version: %v", err)
+		glog.V(1).Infof("Failed to check Docker API version: %v", err)
 		fmt.Fprintf(out, "WARNING: Cannot verify Docker version\n")
 		return nil
 	}
-	needVersion := dockerVersion112
-	glog.V(5).Infof("Checking that docker version is at least %v", needVersion)
-	if ver.LT(needVersion) {
-		fmt.Fprintf(out, "WARNING: Docker version is %v, it needs to be >= %v\n", ver, needVersion)
+	c.isRHDocker = isRHDocker
+
+	glog.V(5).Infof("Checking that docker API version is at least %v", dockerAPIVersion122)
+	if versions.LessThan(ver, dockerAPIVersion122) {
+		fmt.Fprintf(out, "WARNING: Docker version is %v, it needs to be >= %v\n", ver, dockerAPIVersion122)
 	}
 	return nil
 }
@@ -643,7 +701,7 @@ func (c *ClientStartConfig) EnsureDefaultRedirectURIs(out io.Writer) error {
 		return nil
 	}
 
-	webConsoleOAuth, err := oc.OAuthClients().Get(defaultRedirectClient)
+	webConsoleOAuth, err := oc.OAuthClients().Get(defaultRedirectClient, metav1.GetOptions{})
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			fmt.Fprintf(out, "Unable to find OAuthClient %q\n", defaultRedirectClient)
@@ -729,10 +787,9 @@ func (c *CommonStartConfig) DetermineServerIP(out io.Writer) error {
 	return nil
 }
 
-// updateNoProxy will add some default values to the NO_PROXY setting
-// if they are not present
+// updateNoProxy will add some default values to the NO_PROXY setting if they are not present
 func (c *ClientStartConfig) updateNoProxy() {
-	values := []string{"127.0.0.1", c.ServerIP, "localhost", openshift.RegistryServiceIP, "172.30.0.0/8"}
+	values := []string{"127.0.0.1", c.ServerIP, "localhost", openshift.RegistryServiceIP, openshift.ServiceCatalogServiceIP, "172.30.0.0/8"}
 	ipFromServer, err := c.OpenShiftHelper().ServerIP()
 	if err == nil {
 		values = append(values, ipFromServer)
@@ -778,6 +835,7 @@ func (c *ClientStartConfig) StartOpenShift(out io.Writer) error {
 		HTTPSProxy:               c.HTTPSProxy,
 		NoProxy:                  c.NoProxy,
 		DockerRoot:               dockerRoot,
+		ServiceCatalog:           c.ShouldInstallServiceCatalog,
 	}
 	if c.ShouldInstallMetrics {
 		opt.MetricsHost = openshift.MetricsHost(c.RoutingSuffix, c.ServerIP)
@@ -790,10 +848,15 @@ func (c *ClientStartConfig) StartOpenShift(out io.Writer) error {
 		return err
 	}
 
+	serverIP, err := c.OpenShiftHelper().ServerIP()
+	if err != nil {
+		return err
+	}
+
 	// Start a container networking test
 	c.containerNetworkErr = make(chan error)
 	go func() {
-		c.containerNetworkErr <- c.OpenShiftHelper().TestContainerNetworking()
+		c.containerNetworkErr <- c.OpenShiftHelper().TestContainerNetworking(serverIP)
 	}()
 
 	// Setup persistent storage
@@ -816,13 +879,17 @@ func (c *ClientStartConfig) StartOpenShift(out io.Writer) error {
 }
 
 func (c *ClientStartConfig) CheckContainerNetworking(out io.Writer) error {
+	serverIP, err := c.OpenShiftHelper().ServerIP()
+	if err != nil {
+		return err
+	}
 	networkErr := <-c.containerNetworkErr
 	if networkErr != nil {
 		return errors.NewError("containers cannot communicate with the OpenShift master").
 			WithDetails("The cluster was started. However, the container networking test failed.").
 			WithSolution(
 				fmt.Sprintf("Ensure that access to ports tcp/8443, udp/53 and udp/8053 is allowed on %s.\n"+
-					"You may need to open these ports on your machine's firewall.", c.ServerIP)).
+					"You may need to open these ports on your machine's firewall.", serverIP)).
 			WithCause(networkErr)
 	}
 	return nil
@@ -864,16 +931,34 @@ func (c *ClientStartConfig) ImportImageStreams(out io.Writer) error {
 	imageStreamLocations := map[string]string{
 		c.ImageStreams: imageStreams[c.ImageStreams],
 	}
-	return c.importObjects(out, openshiftNamespace, imageStreamLocations)
+	return c.importObjects(out, openshift.OpenshiftNamespace, imageStreamLocations)
 }
 
 // ImportTemplates imports default templates into the server
 // TODO: Use templates compiled into oc
 func (c *ClientStartConfig) ImportTemplates(out io.Writer) error {
-	if err := c.importObjects(out, openshiftNamespace, templateLocations); err != nil {
+	if err := c.importObjects(out, openshift.OpenshiftNamespace, templateLocations); err != nil {
 		return err
 	}
-	return c.importObjects(out, "kube-system", adminTemplateLocations)
+	if err := c.importObjects(out, openshift.OpenshiftInfraNamespace, internalTemplateLocations); err != nil {
+		return err
+	}
+	version, err := c.OpenShiftHelper().ServerVersion()
+	if err != nil {
+		return err
+	}
+	if shouldImportAdminTemplates(version) {
+		return c.importObjects(out, "kube-system", adminTemplateLocations)
+	}
+	return nil
+}
+
+func shouldImportAdminTemplates(v semver.Version) bool {
+	return v.GTE(openshiftVersion36)
+}
+
+func useAnsible(v semver.Version) bool {
+	return v.GTE(openshiftVersion36)
 }
 
 // InstallLogging will start the installation of logging components
@@ -886,6 +971,15 @@ func (c *ClientStartConfig) InstallLogging(out io.Writer) error {
 	if len(publicMaster) == 0 {
 		publicMaster = c.ServerIP
 	}
+	serverVersion, _ := c.OpenShiftHelper().ServerVersion()
+	if useAnsible(serverVersion) {
+		return c.OpenShiftHelper().InstallLoggingViaAnsible(f, c.ServerIP, publicMaster,
+			openshift.LoggingHost(c.RoutingSuffix, c.ServerIP),
+			c.Image,
+			c.ImageVersion,
+			c.HostConfigDir,
+			c.ImageStreams)
+	}
 	return c.OpenShiftHelper().InstallLogging(f, publicMaster, openshift.LoggingHost(c.RoutingSuffix, c.ServerIP), c.Image, c.ImageVersion)
 }
 
@@ -895,7 +989,52 @@ func (c *ClientStartConfig) InstallMetrics(out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	serverVersion, _ := c.OpenShiftHelper().ServerVersion()
+	if useAnsible(serverVersion) {
+		publicMaster := c.PublicHostname
+		if len(publicMaster) == 0 {
+			publicMaster = c.ServerIP
+		}
+		return c.OpenShiftHelper().InstallMetricsViaAnsible(f, c.ServerIP, publicMaster,
+			openshift.MetricsHost(c.RoutingSuffix, c.ServerIP),
+			c.Image,
+			c.ImageVersion,
+			c.HostConfigDir,
+			c.ImageStreams)
+	}
 	return c.OpenShiftHelper().InstallMetrics(f, openshift.MetricsHost(c.RoutingSuffix, c.ServerIP), c.Image, c.ImageVersion)
+}
+
+// CheckServiceCatalogPrereqVersion ensures the OpenShift server version is high enough to
+// run the service catalog.
+func (c *ClientStartConfig) CheckServiceCatalogPrereqVersion(out io.Writer) error {
+	serverVersion, _ := c.OpenShiftHelper().ServerPrereleaseVersion()
+	// 3.6.0-alpha2 was the last release that did not allow the creation of namespace rolebindings w/o first
+	// creating a policybinding object.  This limitation prevents the service catalog template from instantiating.
+
+	// special case for someone who is building a local image using commits based on 3.6.0.alpha2.  They most likely
+	// have the necessary changes.
+	if serverVersion.EQ(openshiftVersion36alpha2) && (serverVersion.String() != openshiftVersion36alpha2.String()) {
+		return nil
+	}
+	if serverVersion.LTE(openshiftVersion36alpha2) {
+		return errors.NewError("Enabling the service catalog requires a newer server level than %v, this server is version %v", openshiftVersion36alpha2, serverVersion)
+	}
+	return nil
+}
+
+// InstallServiceCatalog will start the installation of service catalog components
+func (c *ClientStartConfig) InstallServiceCatalog(out io.Writer) error {
+	f, err := c.Factory()
+	if err != nil {
+		return err
+	}
+	publicMaster := c.PublicHostname
+	if len(publicMaster) == 0 {
+		publicMaster = c.ServerIP
+	}
+
+	return c.OpenShiftHelper().InstallServiceCatalog(f, publicMaster, openshift.CatalogHost(c.RoutingSuffix, c.ServerIP))
 }
 
 // Login logs into the new server and sets up a default user and project
@@ -923,7 +1062,7 @@ func (c *ClientStartConfig) ServerInfo(out io.Writer) error {
 	metricsInfo := ""
 	if c.ShouldInstallMetrics && c.ShouldInitializeData() {
 		metricsInfo = fmt.Sprintf("The metrics service is available at:\n"+
-			"    https://%s\n\n", openshift.MetricsHost(c.RoutingSuffix, c.ServerIP))
+			"    https://%s/hawkular/metrics\n\n", openshift.MetricsHost(c.RoutingSuffix, c.ServerIP))
 	}
 	loggingInfo := ""
 	if c.ShouldInstallLogging && c.ShouldInitializeData() {
@@ -934,22 +1073,43 @@ func (c *ClientStartConfig) ServerInfo(out io.Writer) error {
 	if len(c.PublicHostname) > 0 {
 		masterURL = fmt.Sprintf("https://%s:8443", c.PublicHostname)
 	}
-	msg := fmt.Sprintf("OpenShift server started.\n"+
+	msg := fmt.Sprintf("OpenShift server started.\n\n"+
 		"The server is accessible via web console at:\n"+
 		"    %s\n\n%s%s", masterURL, metricsInfo, loggingInfo)
 
 	if c.ShouldCreateUser() {
 		msg += fmt.Sprintf("You are logged in as:\n"+
 			"    User:     %s\n"+
-			"    Password: %s\n\n", initialUser, initialPassword)
+			"    Password: <any value>\n\n", initialUser)
+		msg += "To login as administrator:\n" +
+			"    oc login -u system:admin\n\n"
 	}
-
-	msg += "To login as administrator:\n" +
-		"    oc login -u system:admin\n\n"
 
 	msg += c.checkProxySettings()
 
 	fmt.Fprintf(out, msg)
+	return nil
+}
+
+// ServiceCatalogInstructions displays information for enabling access to
+// the template service broker after starting with the service catalog enabled.
+func (c *ClientStartConfig) ServiceCatalogInstructions(out io.Writer) error {
+	msg :=
+		"In order to enable access to the Template Service Broker for use with the " +
+			"Service Catalog, you must first grant unauthenticated access to the " +
+			"template service broker api.\n\n" +
+			"WARNING: Enabling this access allows anyone who can see your cluster api " +
+			"server to provision templates within your cluster, impersonating any user " +
+			"in the cluster (including administrators).  This can be used to gain full " +
+			"administrative access to your cluster.  Do not allow this access unless " +
+			"you fully understand the implications.  To enable unauthenticated access " +
+			"to the template service broker api, run the following command as cluster " +
+			"admin:\n\n" +
+			"oc adm policy add-cluster-role-to-group system:openshift:templateservicebroker-client system:unauthenticated system:authenticated\n\n" +
+			"WARNING: Running the above command allows unauthenticated users to access " +
+			"and potentially exploit your cluster.\n\n"
+	fmt.Fprintf(out, msg)
+
 	return nil
 }
 
@@ -1029,7 +1189,7 @@ func (c *ClientStartConfig) Clients() (*client.Client, kclientset.Interface, err
 // OpenShiftHelper returns a helper object to work with OpenShift on the server
 func (c *CommonStartConfig) OpenShiftHelper() *openshift.Helper {
 	if c.openshiftHelper == nil {
-		c.openshiftHelper = openshift.NewHelper(c.dockerClient, c.HostHelper(), c.openshiftImage(), openshift.OpenShiftContainer, c.PublicHostname, c.RoutingSuffix)
+		c.openshiftHelper = openshift.NewHelper(c.DockerHelper(), c.HostHelper(), c.openshiftImage(), openshift.OpenShiftContainer, c.PublicHostname, c.RoutingSuffix)
 	}
 	return c.openshiftHelper
 }
@@ -1037,7 +1197,7 @@ func (c *CommonStartConfig) OpenShiftHelper() *openshift.Helper {
 // HostHelper returns a helper object to check Host configuration
 func (c *CommonStartConfig) HostHelper() *host.HostHelper {
 	if c.hostHelper == nil {
-		c.hostHelper = host.NewHostHelper(c.dockerClient, c.openshiftImage(), c.HostVolumesDir, c.HostConfigDir, c.HostDataDir, c.HostPersistentVolumesDir)
+		c.hostHelper = host.NewHostHelper(c.DockerHelper(), c.openshiftImage(), c.HostVolumesDir, c.HostConfigDir, c.HostDataDir, c.HostPersistentVolumesDir)
 	}
 	return c.hostHelper
 }
@@ -1045,7 +1205,7 @@ func (c *CommonStartConfig) HostHelper() *host.HostHelper {
 // DockerHelper returns a helper object to work with the Docker client
 func (c *CommonStartConfig) DockerHelper() *dockerhelper.Helper {
 	if c.dockerHelper == nil {
-		c.dockerHelper = dockerhelper.NewHelper(c.dockerClient, c.engineAPIClient)
+		c.dockerHelper = dockerhelper.NewHelper(c.dockerClient)
 	}
 	return c.dockerHelper
 }
@@ -1069,12 +1229,12 @@ func (c *CommonStartConfig) openshiftImage() string {
 	return fmt.Sprintf("%s:%s", c.Image, c.ImageVersion)
 }
 
-func getDockerMachineClient(machine string, out io.Writer, canStart bool) (*docker.Client, *dockerclient.Client, error) {
+func getDockerMachineClient(machine string, out io.Writer, canStart bool) (dockerhelper.Interface, error) {
 	if !dockermachine.IsRunning(machine) && canStart {
 		fmt.Fprintf(out, "Starting Docker machine '%s'\n", machine)
 		err := dockermachine.Start(machine)
 		if err != nil {
-			return nil, nil, errors.NewError("cannot start Docker machine %q", machine).WithCause(err)
+			return nil, errors.NewError("cannot start Docker machine %q", machine).WithCause(err)
 		}
 		fmt.Fprintf(out, "Started Docker machine '%s'\n", machine)
 	}
@@ -1209,7 +1369,7 @@ func (c *ClientStartConfig) ShouldInitializeData() bool {
 			return true
 		}
 
-		if _, err = kclient.Core().Services(openshift.DefaultNamespace).Get(openshift.SvcDockerRegistry); err != nil {
+		if _, err = kclient.Core().Services(openshift.DefaultNamespace).Get(openshift.SvcDockerRegistry, metav1.GetOptions{}); err != nil {
 			return true
 		}
 

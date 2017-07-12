@@ -1,16 +1,16 @@
 package delegated
 
 import (
+	"k8s.io/apimachinery/pkg/runtime"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/runtime"
 
 	oapi "github.com/openshift/origin/pkg/api"
-	authorizationapi "github.com/openshift/origin/pkg/authorization/api"
-	authorizationapiv1 "github.com/openshift/origin/pkg/authorization/api/v1"
+	authorizationapi "github.com/openshift/origin/pkg/authorization/apis/authorization"
+	authorizationapiv1 "github.com/openshift/origin/pkg/authorization/apis/authorization/v1"
 	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
-	projectapi "github.com/openshift/origin/pkg/project/api"
-	projectapiv1 "github.com/openshift/origin/pkg/project/api/v1"
-	templateapi "github.com/openshift/origin/pkg/template/api"
+	projectapi "github.com/openshift/origin/pkg/project/apis/project"
+	projectapiv1 "github.com/openshift/origin/pkg/project/apis/project/v1"
+	templateapi "github.com/openshift/origin/pkg/template/apis/template"
 )
 
 const (

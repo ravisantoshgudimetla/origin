@@ -1,13 +1,15 @@
 package etcd
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/registry/rest"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
 
-	"github.com/openshift/origin/pkg/quota/api"
+	quotaapi "github.com/openshift/origin/pkg/quota/apis/quota"
 	"github.com/openshift/origin/pkg/quota/registry/clusterresourcequota"
 	"github.com/openshift/origin/pkg/util/restoptions"
 )
@@ -19,20 +21,19 @@ type REST struct {
 // NewREST returns a RESTStorage object that will work against ClusterResourceQuota objects.
 func NewREST(optsGetter restoptions.Getter) (*REST, *StatusREST, error) {
 	store := &registry.Store{
-		NewFunc:           func() runtime.Object { return &api.ClusterResourceQuota{} },
-		NewListFunc:       func() runtime.Object { return &api.ClusterResourceQuotaList{} },
+		Copier:            kapi.Scheme,
+		NewFunc:           func() runtime.Object { return &quotaapi.ClusterResourceQuota{} },
+		NewListFunc:       func() runtime.Object { return &quotaapi.ClusterResourceQuotaList{} },
 		PredicateFunc:     clusterresourcequota.Matcher,
-		QualifiedResource: api.Resource("clusterresourcequotas"),
+		QualifiedResource: quotaapi.Resource("clusterresourcequotas"),
 
 		CreateStrategy: clusterresourcequota.Strategy,
 		UpdateStrategy: clusterresourcequota.Strategy,
 		DeleteStrategy: clusterresourcequota.Strategy,
 	}
 
-	// TODO this will be uncommented after 1.6 rebase:
-	// options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: clusterresourcequota.GetAttrs}
-	// if err := store.CompleteWithOptions(options); err != nil {
-	if err := restoptions.ApplyOptions(optsGetter, store, storage.NoTriggerPublisher); err != nil {
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: clusterresourcequota.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
 		return nil, nil, err
 	}
 
@@ -53,15 +54,15 @@ type StatusREST struct {
 var _ = rest.Patcher(&StatusREST{})
 
 func (r *StatusREST) New() runtime.Object {
-	return &api.ClusterResourceQuota{}
+	return &quotaapi.ClusterResourceQuota{}
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx kapi.Context, name string) (runtime.Object, error) {
-	return r.store.Get(ctx, name)
+func (r *StatusREST) Get(ctx apirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	return r.store.Get(ctx, name, options)
 }
 
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx kapi.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+func (r *StatusREST) Update(ctx apirequest.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
 	return r.store.Update(ctx, name, objInfo)
 }

@@ -14,7 +14,9 @@ import (
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 
-	"github.com/openshift/origin/pkg/build/api"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/jenkins"
 )
@@ -42,7 +44,7 @@ func debugAnyJenkinsFailure(br *exutil.BuildResult, name string, oc *exutil.CLI,
 			fmt.Fprintf(g.GinkgoWriter, "\n error getting %s job log: %#v", name, err)
 		}
 		if dumpMaster {
-			exutil.DumpDeploymentLogs("jenkins", oc)
+			exutil.DumpApplicationPodLogs("jenkins", oc)
 		}
 		fmt.Fprintf(g.GinkgoWriter, "\n\n END debugAnyJenkinsFailure\n\n")
 	}
@@ -54,8 +56,13 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 		jenkinsTemplatePath    = exutil.FixturePath("..", "..", "examples", "jenkins", "jenkins-ephemeral-template.json")
 		mavenSlavePipelinePath = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "maven-pipeline.yaml")
 		//orchestrationPipelinePath = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "mapsapp-pipeline.yaml")
-		blueGreenPipelinePath    = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "bluegreen-pipeline.yaml")
-		clientPluginPipelinePath = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "openshift-client-plugin-pipeline.yaml")
+		blueGreenPipelinePath         = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "bluegreen-pipeline.yaml")
+		clientPluginPipelinePath      = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "openshift-client-plugin-pipeline.yaml")
+		envVarsPipelinePath           = exutil.FixturePath("testdata", "samplepipeline-withenvs.yaml")
+		configMapPodTemplatePath      = exutil.FixturePath("testdata", "config-map-jenkins-slave-pods.yaml")
+		imagestreamPodTemplatePath    = exutil.FixturePath("testdata", "imagestream-jenkins-slave-pods.yaml")
+		imagestreamtagPodTemplatePath = exutil.FixturePath("testdata", "imagestreamtag-jenkins-slave-pods.yaml")
+		podTemplateSlavePipelinePath  = exutil.FixturePath("testdata", "jenkins-slave-template.yaml")
 
 		oc                       = exutil.NewCLI("jenkins-pipeline", exutil.KubeConfigPath())
 		ticker                   *time.Ticker
@@ -65,7 +72,8 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 		setupJenkins             = func() {
 			// Deploy Jenkins
 			var licensePrefix, pluginName string
-			newAppArgs := []string{"-f", jenkinsTemplatePath}
+			// our pipeline jobs, between jenkins and oc invocations, need more mem than the default
+			newAppArgs := []string{"-f", jenkinsTemplatePath, "-p", "MEMORY_LIMIT=2Gi"}
 			newAppArgs, useSnapshotImage := jenkins.SetupSnapshotImage(jenkins.UseLocalClientPluginSnapshotEnvVarName, localClientPluginSnapshotImage, localClientPluginSnapshotImageStream, newAppArgs, oc)
 			if !useSnapshotImage {
 				newAppArgs, useSnapshotImage = jenkins.SetupSnapshotImage(jenkins.UseLocalSyncPluginSnapshotEnvVarName, localSyncPluginSnapshotImage, localSyncPluginSnapshotImageStream, newAppArgs, oc)
@@ -81,7 +89,7 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 			o.Expect(err).NotTo(o.HaveOccurred())
 
 			g.By("waiting for jenkins deployment")
-			err = exutil.WaitForADeploymentToComplete(oc.KubeClient().Core().ReplicationControllers(oc.Namespace()), "jenkins", oc)
+			err = exutil.WaitForDeploymentConfig(oc.KubeClient(), oc.Client(), oc.Namespace(), "jenkins", 1, oc)
 			o.Expect(err).NotTo(o.HaveOccurred())
 
 			j = jenkins.NewRef(oc)
@@ -90,7 +98,7 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 			_, err = j.WaitForContent("", 200, 10*time.Minute, "")
 
 			if err != nil {
-				exutil.DumpDeploymentLogs("jenkins", oc)
+				exutil.DumpApplicationPodLogs("jenkins", oc)
 			}
 
 			o.Expect(err).NotTo(o.HaveOccurred())
@@ -115,9 +123,8 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 	g.BeforeEach(func() {
 		setupJenkins()
 
-		if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
-			g.By("start jenkins gc tracking")
-			ticker = jenkins.StartJenkinsGCTracking(oc, oc.Namespace())
+		if os.Getenv(jenkins.DisableJenkinsMemoryStats) == "" {
+			ticker = jenkins.StartJenkinsMemoryTracking(oc, oc.Namespace())
 		}
 
 		g.By("waiting for builder service account")
@@ -127,8 +134,7 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 
 	g.Context("Pipeline with maven slave", func() {
 		g.AfterEach(func() {
-			if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
-				g.By("stopping jenkins gc tracking")
+			if os.Getenv(jenkins.DisableJenkinsMemoryStats) == "" {
 				ticker.Stop()
 			}
 		})
@@ -141,7 +147,11 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 
 			// start the build
 			g.By("starting the pipeline build and waiting for it to complete")
-			br, _ := exutil.StartBuildAndWait(oc, "openshift-jee-sample")
+			br, err := exutil.StartBuildAndWait(oc, "openshift-jee-sample")
+			if err != nil || !br.BuildSuccess {
+				exutil.DumpBuildLogs("openshift-jee-sample-docker", oc)
+				exutil.DumpDeploymentLogs("openshift-jee-sample", 1, oc)
+			}
 			debugAnyJenkinsFailure(br, oc.Namespace()+"-openshift-jee-sample", oc, true)
 			br.AssertSuccess()
 
@@ -152,10 +162,117 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 		})
 	})
 
-	g.Context("Pipeline using jenkins-client-plugin", func() {
+	g.Context("Pipeline using config map slave", func() {
 		g.AfterEach(func() {
 			if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
 				g.By("stopping jenkins gc tracking")
+				ticker.Stop()
+			}
+		})
+
+		g.It("should build and complete successfully", func() {
+			g.By("create the pod template with config map")
+			err := oc.Run("create").Args("-f", configMapPodTemplatePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By(fmt.Sprintf("calling oc new-app -f %q", podTemplateSlavePipelinePath))
+			err = oc.Run("new-app").Args("-f", podTemplateSlavePipelinePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("starting the pipeline build and waiting for it to complete")
+			br, err := exutil.StartBuildAndWait(oc, "openshift-jee-sample")
+			if err != nil || !br.BuildSuccess {
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			debugAnyJenkinsFailure(br, oc.Namespace()+"-openshift-jee-sample", oc, true)
+			br.AssertSuccess()
+
+			g.By("getting job log")
+			out, err := j.GetLastJobConsoleLogs(oc.Namespace() + "-openshift-jee-sample")
+			o.Expect(err).NotTo(o.HaveOccurred())
+			g.By("making sure job log has success message")
+			o.Expect(out).To(o.ContainSubstring("Finished: SUCCESS"))
+			g.By("making sure job log ran with our config map slave pod template")
+			o.Expect(out).To(o.ContainSubstring("Running on jenkins-slave"))
+		})
+	})
+
+	g.Context("Pipeline using imagestream slave", func() {
+		g.AfterEach(func() {
+			if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
+				g.By("stopping jenkins gc tracking")
+				ticker.Stop()
+			}
+		})
+
+		g.It("should build and complete successfully", func() {
+			g.By("create the pod template with imagestream")
+			err := oc.Run("create").Args("-f", imagestreamPodTemplatePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By(fmt.Sprintf("calling oc new-app -f %q", podTemplateSlavePipelinePath))
+			err = oc.Run("new-app").Args("-f", podTemplateSlavePipelinePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("starting the pipeline build and waiting for it to complete")
+			br, err := exutil.StartBuildAndWait(oc, "openshift-jee-sample")
+			if err != nil || !br.BuildSuccess {
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			debugAnyJenkinsFailure(br, oc.Namespace()+"-openshift-jee-sample", oc, true)
+			br.AssertSuccess()
+
+			g.By("getting job log")
+			out, err := j.GetLastJobConsoleLogs(oc.Namespace() + "-openshift-jee-sample")
+			o.Expect(err).NotTo(o.HaveOccurred())
+			g.By("making sure job log has success message")
+			o.Expect(out).To(o.ContainSubstring("Finished: SUCCESS"))
+			g.By("making sure job log ran with our config map slave pod template")
+			o.Expect(out).To(o.ContainSubstring("Running on jenkins-slave"))
+		})
+	})
+
+	g.Context("Pipeline using imagestreamtag slave", func() {
+		g.AfterEach(func() {
+			if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
+				g.By("stopping jenkins gc tracking")
+				ticker.Stop()
+			}
+		})
+
+		g.It("should build and complete successfully", func() {
+			g.By("create the pod template with imagestream")
+			err := oc.Run("create").Args("-f", imagestreamtagPodTemplatePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By(fmt.Sprintf("calling oc new-app -f %q", podTemplateSlavePipelinePath))
+			err = oc.Run("new-app").Args("-f", podTemplateSlavePipelinePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("starting the pipeline build and waiting for it to complete")
+			br, err := exutil.StartBuildAndWait(oc, "openshift-jee-sample")
+			if err != nil || !br.BuildSuccess {
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			debugAnyJenkinsFailure(br, oc.Namespace()+"-openshift-jee-sample", oc, true)
+			br.AssertSuccess()
+
+			g.By("getting job log")
+			out, err := j.GetLastJobConsoleLogs(oc.Namespace() + "-openshift-jee-sample")
+			o.Expect(err).NotTo(o.HaveOccurred())
+			g.By("making sure job log has success message")
+			o.Expect(out).To(o.ContainSubstring("Finished: SUCCESS"))
+			g.By("making sure job log ran with our config map slave pod template")
+			o.Expect(out).To(o.ContainSubstring("Running on slave-jenkins"))
+		})
+	})
+
+	g.Context("Pipeline using jenkins-client-plugin", func() {
+		g.AfterEach(func() {
+			if os.Getenv(jenkins.DisableJenkinsMemoryStats) == "" {
 				ticker.Stop()
 			}
 		})
@@ -168,13 +285,105 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 
 			// start the build
 			g.By("starting the pipeline build and waiting for it to complete")
-			br, _ := exutil.StartBuildAndWait(oc, "sample-pipeline-openshift-client-plugin")
+			br, err := exutil.StartBuildAndWait(oc, "sample-pipeline-openshift-client-plugin")
 			debugAnyJenkinsFailure(br, oc.Namespace()+"-sample-pipeline-openshift-client-plugin", oc, true)
+			if err != nil || !br.BuildSuccess {
+				exutil.DumpBuildLogs("ruby", oc)
+				exutil.DumpDeploymentLogs("mongodb", 1, oc)
+				exutil.DumpDeploymentLogs("jenkins-second-deployment", 1, oc)
+				exutil.DumpDeploymentLogs("jenkins-second-deployment", 2, oc)
+			}
 			br.AssertSuccess()
 
 			g.By("get build console logs and see if succeeded")
 			_, err = j.WaitForContent("Finished: SUCCESS", 200, 10*time.Minute, "job/%s-sample-pipeline-openshift-client-plugin/lastBuild/consoleText", oc.Namespace())
 			o.Expect(err).NotTo(o.HaveOccurred())
+		})
+	})
+
+	g.Context("Pipeline with env vars", func() {
+		g.AfterEach(func() {
+			if os.Getenv(jenkins.DisableJenkinsMemoryStats) == "" {
+				ticker.Stop()
+			}
+		})
+
+		g.It("should build and complete successfully", func() {
+			// instantiate the bc
+			g.By(fmt.Sprintf("calling oc new-app -f %q", envVarsPipelinePath))
+			err := oc.Run("new-app").Args("-f", envVarsPipelinePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// start the build
+			g.By("starting the pipeline build, including env var, and waiting for it to complete")
+			br, err := exutil.StartBuildAndWait(oc, "-e", "FOO2=BAR2", "sample-pipeline-withenvs")
+			if err != nil || !br.BuildSuccess {
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			debugAnyJenkinsFailure(br, oc.Namespace()+"-sample-pipeline-withenvs", oc, true)
+			br.AssertSuccess()
+
+			g.By("confirm all the log annotations are there")
+			_, err = jenkins.ProcessLogURLAnnotations(oc, br)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and see if succeeded")
+			_, err = j.WaitForContent("Finished: SUCCESS", 200, 10*time.Minute, "job/%s-sample-pipeline-withenvs/lastBuild/consoleText", oc.Namespace())
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and see if env is set")
+			_, err = j.WaitForContent("FOO2 is BAR2", 200, 10*time.Minute, "job/%s-sample-pipeline-withenvs/lastBuild/consoleText", oc.Namespace())
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// start the nextbuild
+			g.By("starting the pipeline build and waiting for it to complete")
+			br, err = exutil.StartBuildAndWait(oc, "sample-pipeline-withenvs")
+			if err != nil || !br.BuildSuccess {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			debugAnyJenkinsFailure(br, oc.Namespace()+"-sample-pipeline-withenvs", oc, true)
+			br.AssertSuccess()
+
+			g.By("get build console logs and see if succeeded")
+			_, err = j.WaitForContent("Finished: SUCCESS", 200, 10*time.Minute, "job/%s-sample-pipeline-withenvs/lastBuild/consoleText", oc.Namespace())
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and see if env is set")
+			_, err = j.WaitForContent("FOO1 is BAR1", 200, 10*time.Minute, "job/%s-sample-pipeline-withenvs/lastBuild/consoleText", oc.Namespace())
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and see if env is still not set")
+			_, err = j.WaitForContent("FOO2 is null", 200, 10*time.Minute, "job/%s-sample-pipeline-withenvs/lastBuild/consoleText", oc.Namespace())
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+				exutil.ExaminePodDiskUsage(oc)
+				exutil.ExamineDiskUsage()
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
 		})
 	})
 
@@ -210,8 +419,7 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 
 	g.Context("Blue-green pipeline", func() {
 		g.AfterEach(func() {
-			if os.Getenv(jenkins.DisableJenkinsGCStats) == "" {
-				g.By("stopping jenkins gc tracking")
+			if os.Getenv(jenkins.DisableJenkinsMemoryStats) == "" {
 				ticker.Stop()
 			}
 		})
@@ -226,6 +434,11 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 				// start the build
 				g.By("starting the bluegreen pipeline build")
 				br, err := exutil.StartBuildResult(oc, "bluegreen-pipeline")
+				if err != nil || !br.BuildSuccess {
+					debugAnyJenkinsFailure(br, oc.Namespace()+"-bluegreen-pipeline", oc, false)
+					exutil.ExaminePodDiskUsage(oc)
+					exutil.ExamineDiskUsage()
+				}
 				o.Expect(err).NotTo(o.HaveOccurred())
 
 				errs := make(chan error, 2)
@@ -236,12 +449,12 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 					g.By("Waiting for the build uri")
 					var jenkinsBuildURI string
 					for {
-						build, err := oc.Client().Builds(oc.Namespace()).Get(br.BuildName)
+						build, err := oc.Client().Builds(oc.Namespace()).Get(br.BuildName, metav1.GetOptions{})
 						if err != nil {
 							errs <- fmt.Errorf("error getting build: %s", err)
 							return
 						}
-						jenkinsBuildURI = build.Annotations[api.BuildJenkinsBuildURIAnnotation]
+						jenkinsBuildURI = build.Annotations[buildapi.BuildJenkinsBuildURIAnnotation]
 						if jenkinsBuildURI != "" {
 							break
 						}
@@ -286,7 +499,7 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 					defer g.GinkgoRecover()
 
 					for {
-						build, err := oc.Client().Builds(oc.Namespace()).Get(br.BuildName)
+						build, err := oc.Client().Builds(oc.Namespace()).Get(br.BuildName, metav1.GetOptions{})
 						switch {
 						case err != nil:
 							errs <- fmt.Errorf("error getting build: %s", err)
@@ -321,6 +534,11 @@ var _ = g.Describe("[builds][Slow] openshift pipeline build", func() {
 				}
 
 				debugAnyJenkinsFailure(br, oc.Namespace()+"-bluegreen-pipeline", oc, true)
+				if err != nil || !br.BuildSuccess {
+					debugAnyJenkinsFailure(br, oc.Namespace()+"-bluegreen-pipeline", oc, false)
+					exutil.ExaminePodDiskUsage(oc)
+					exutil.ExamineDiskUsage()
+				}
 				br.AssertSuccess()
 				o.Expect(err).NotTo(o.HaveOccurred())
 

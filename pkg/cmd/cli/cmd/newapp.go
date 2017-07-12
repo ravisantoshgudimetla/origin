@@ -15,20 +15,21 @@ import (
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
+	kapierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	restclient "k8s.io/client-go/rest"
 	kapi "k8s.io/kubernetes/pkg/api"
-	kapierrors "k8s.io/kubernetes/pkg/api/errors"
 	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/internalversion"
-	"k8s.io/kubernetes/pkg/client/restclient"
 	ctl "k8s.io/kubernetes/pkg/kubectl"
 	kcmd "k8s.io/kubernetes/pkg/kubectl/cmd"
 	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 	"k8s.io/kubernetes/pkg/kubectl/resource"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/errors"
-	"k8s.io/kubernetes/pkg/util/sets"
-	"k8s.io/kubernetes/pkg/util/wait"
 
-	buildapi "github.com/openshift/origin/pkg/build/api"
+	buildapi "github.com/openshift/origin/pkg/build/apis/build"
 	"github.com/openshift/origin/pkg/cmd/templates"
 	cmdutil "github.com/openshift/origin/pkg/cmd/util"
 	"github.com/openshift/origin/pkg/cmd/util/clientcmd"
@@ -38,7 +39,7 @@ import (
 	newapp "github.com/openshift/origin/pkg/generate/app"
 	newcmd "github.com/openshift/origin/pkg/generate/app/cmd"
 	"github.com/openshift/origin/pkg/generate/git"
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 	"github.com/openshift/origin/pkg/util"
 )
 
@@ -152,8 +153,21 @@ func (o *ObjectGeneratorOptions) Complete(baseName, commandName string, f *clien
 	}
 	o.Config.ErrOut = o.ErrOut
 
+	clientConfig, err := f.ClientConfig()
+	if err != nil {
+		return err
+	}
+	mapper, typer := f.Object()
+	// ignore errors.   We use this to make a best guess at preferred seralizations, but the command might run without a server
+	discoveryClient, _ := f.DiscoveryClient()
+
 	o.Action.Out, o.Action.ErrOut = out, o.ErrOut
-	o.Action.Bulk.Mapper = clientcmd.ResourceMapper(f)
+	o.Action.Bulk.Mapper = &resource.Mapper{
+		RESTMapper:   mapper,
+		ObjectTyper:  typer,
+		ClientMapper: configcmd.ClientMapperFromConfig(clientConfig),
+	}
+	o.Action.Bulk.PreferredSerializationOrder = configcmd.PreferredSerializationOrder(discoveryClient)
 	o.Action.Bulk.Op = configcmd.Create
 	// Retry is used to support previous versions of the API server that will
 	// consider the presence of an unknown trigger type to be an error.
@@ -167,7 +181,6 @@ func (o *ObjectGeneratorOptions) Complete(baseName, commandName string, f *clien
 	o.BaseName = baseName
 	o.CommandName = commandName
 
-	mapper, _ := f.Object()
 	o.PrintObject = cmdutil.VersionedPrintObject(f.PrintObject, c, mapper, out)
 	o.LogsForObject = f.LogsForObject
 	if err := CompleteAppConfig(o.Config, f, c, args); err != nil {
@@ -294,7 +307,6 @@ func (o *NewAppOptions) RunNewApp() error {
 			}
 		}
 	}
-
 	if err := setAnnotations(map[string]string{newcmd.GeneratedByNamespace: newcmd.GeneratedByNewApp}, result); err != nil {
 		return err
 	}
@@ -388,7 +400,7 @@ func followInstallation(config *newcmd.AppConfig, input string, pod *kapi.Pod, l
 		LogsForObject: logsForObjectFn,
 		Out:           config.Out,
 	}
-	_, logErr := opts.RunLogs()
+	logErr := opts.RunLogs()
 
 	// status of the pod may take tens of seconds to propagate
 	if err := wait.PollImmediate(500*time.Millisecond, 30*time.Second, installationComplete(podClient, pod.Name, config.Out)); err != nil {
@@ -408,7 +420,7 @@ func followInstallation(config *newcmd.AppConfig, input string, pod *kapi.Pod, l
 
 func installationStarted(c kcoreclient.PodInterface, name string, s kcoreclient.SecretInterface) wait.ConditionFunc {
 	return func() (bool, error) {
-		pod, err := c.Get(name)
+		pod, err := c.Get(name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -416,7 +428,7 @@ func installationStarted(c kcoreclient.PodInterface, name string, s kcoreclient.
 			return false, nil
 		}
 		// delete a secret named the same as the pod if it exists
-		if secret, err := s.Get(name); err == nil {
+		if secret, err := s.Get(name, metav1.GetOptions{}); err == nil {
 			if secret.Annotations[newcmd.GeneratedForJob] == "true" &&
 				secret.Annotations[newcmd.GeneratedForJobFor] == pod.Annotations[newcmd.GeneratedForJobFor] {
 				if err := s.Delete(name, nil); err != nil {
@@ -430,7 +442,7 @@ func installationStarted(c kcoreclient.PodInterface, name string, s kcoreclient.
 
 func installationComplete(c kcoreclient.PodInterface, name string, out io.Writer) wait.ConditionFunc {
 	return func() (bool, error) {
-		pod, err := c.Get(name)
+		pod, err := c.Get(name, metav1.GetOptions{})
 		if err != nil {
 			if kapierrors.IsNotFound(err) {
 				return false, fmt.Errorf("installation pod was deleted; unable to determine whether it completed successfully")
@@ -543,7 +555,7 @@ func setAnnotations(annotations map[string]string, result *newcmd.AppResult) err
 	for _, object := range result.List.Items {
 		err := util.AddObjectAnnotations(object, annotations)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to add annotation to object of type %q, this resource type is probably unsupported by your client version.", object.GetObjectKind().GroupVersionKind())
 		}
 	}
 	return nil
@@ -553,7 +565,7 @@ func setLabels(labels map[string]string, result *newcmd.AppResult) error {
 	for _, object := range result.List.Items {
 		err := util.AddObjectLabels(object, labels)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to add annotation to object of type %q, this resource type is probably unsupported by your client version.", object.GetObjectKind().GroupVersionKind())
 		}
 	}
 	return nil
@@ -593,9 +605,11 @@ func isInvalidTriggerError(err error) bool {
 // type that is not in the whitelist for an older server.
 func retryBuildConfig(info *resource.Info, err error) runtime.Object {
 	triggerTypeWhiteList := map[buildapi.BuildTriggerType]struct{}{
-		buildapi.GitHubWebHookBuildTriggerType:  {},
-		buildapi.GenericWebHookBuildTriggerType: {},
-		buildapi.ImageChangeBuildTriggerType:    {},
+		buildapi.GitHubWebHookBuildTriggerType:    {},
+		buildapi.GenericWebHookBuildTriggerType:   {},
+		buildapi.ImageChangeBuildTriggerType:      {},
+		buildapi.GitLabWebHookBuildTriggerType:    {},
+		buildapi.BitbucketWebHookBuildTriggerType: {},
 	}
 	if buildapi.IsKindOrLegacy("BuildConfig", info.Mapping.GroupVersionKind.GroupKind()) && isInvalidTriggerError(err) {
 		bc, ok := info.Object.(*buildapi.BuildConfig)
@@ -633,8 +647,11 @@ func handleError(err error, baseName, commandName, commandPath string, config *n
 			fmt.Fprintf(buf, fmt.Sprintf("\n%s:  %v\n", classErr.Key, classErr.Value))
 		}
 		fmt.Fprint(buf, "\n")
+		// this print serves as a header for the printing of the errorGroups, but
+		// only print it if we precede with classification errors, to help distinguish
+		// between the two
+		fmt.Fprintln(buf, "Errors occurred during resource creation:")
 	}
-	fmt.Fprintln(buf, "Errors occurred during resource creation:")
 	for _, group := range groups {
 		fmt.Fprint(buf, kcmdutil.MultipleErrors("error: ", group.errs))
 		if len(group.suggestion) > 0 {

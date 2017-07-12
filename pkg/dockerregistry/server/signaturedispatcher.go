@@ -7,7 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 
-	kapierrors "k8s.io/kubernetes/pkg/api/errors"
+	kapierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	ctxu "github.com/docker/distribution/context"
 
@@ -16,7 +16,7 @@ import (
 	"github.com/docker/distribution/registry/api/v2"
 	"github.com/docker/distribution/registry/handlers"
 
-	imageapi "github.com/openshift/origin/pkg/image/api"
+	imageapi "github.com/openshift/origin/pkg/image/apis/image"
 
 	gorillahandlers "github.com/gorilla/handlers"
 )

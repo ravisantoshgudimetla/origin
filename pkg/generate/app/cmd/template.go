@@ -5,15 +5,15 @@ import (
 	"io"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/errors"
 	kapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/errors"
 
 	"github.com/openshift/origin/pkg/api/latest"
 	"github.com/openshift/origin/pkg/client"
 	"github.com/openshift/origin/pkg/generate/app"
 	"github.com/openshift/origin/pkg/template"
-	templateapi "github.com/openshift/origin/pkg/template/api"
+	templateapi "github.com/openshift/origin/pkg/template/apis/template"
 )
 
 // TransformTemplate processes a template with the provided parameters, returning an error if transformation fails.
@@ -50,7 +50,7 @@ func TransformTemplate(tpl *templateapi.Template, client client.TemplateConfigsN
 }
 
 func formatString(out io.Writer, tab, s string) {
-	labelVals := strings.Split(s, "\n")
+	labelVals := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 
 	for _, lval := range labelVals {
 		fmt.Fprintf(out, fmt.Sprintf("%s%s\n", tab, lval))
@@ -83,7 +83,6 @@ func DescribeGeneratedTemplate(out io.Writer, input string, result *templateapi.
 			formatString(out, "     ", message)
 			fmt.Fprintln(out)
 		}
-		fmt.Fprintln(out)
 	}
 
 	if warnings := result.Annotations[app.GenerationWarningAnnotation]; len(warnings) > 0 {
