@@ -1,0 +1,48 @@
+# my global config
+global:
+  scrape_interval:     15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+  # Attach these labels to any time series or alerts when communicating with
+  # external systems (federation, remote storage, Alertmanager).
+  external_labels:
+      monitor: 'codelab-monitor'
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first.rules"
+  # - "second.rules"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+    scheme: https
+    tls_config:
+      #ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    # If your node certificates are self-signed or use a different CA to the
+    #     # master CA, then disable certificate verification below. Note that
+    #         # certificate verification is an integral part of a secure infrastructure
+    #             # so this should only be disabled in a controlled environment. You can
+    #                 # disable certificate verification by uncommenting the line below.
+    #                     #
+      insecure_skip_verify: true
+      #cert_file:  
+      #key_file:
+      #server_name: 'https://prometheus.kube-system.svc:443/metrics'
+    #
+    static_configs:
+      - targets: ['prometheus.kube-system.svc:443']
+  - job_name: 'prom-api'
+    scheme: https
+    tls_config:
+      cert_file: '/etc/origin/master/admin.crt'
+      key_file: '/etc/origin/master/admin.key'
+      insecure_skip_verify: true
+    static_configs:
+      - targets: ['ip-172-31-5-242.us-west-2.compute.internal:8443']
