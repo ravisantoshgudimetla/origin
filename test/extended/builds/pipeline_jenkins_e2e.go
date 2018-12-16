@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -20,127 +21,184 @@ import (
 
 	buildutil "github.com/openshift/origin/pkg/build/util"
 	exutil "github.com/openshift/origin/test/extended/util"
+	"github.com/openshift/origin/test/extended/util/jenkins"
 )
 
-var _ = g.Describe("[Slow]jenkins repos e2e openshift pipeline build", func() {
+var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipeline build", func() {
 	defer g.GinkgoRecover()
+
+	var (
+		jenkinsEphemeralTemplatePath  = exutil.FixturePath("..", "..", "examples", "jenkins", "jenkins-ephemeral-template.json")
+		jenkinsPersistentTemplatePath = exutil.FixturePath("..", "..", "examples", "jenkins", "jenkins-persistent-template.json")
+		nodejsDeclarativePipelinePath = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "nodejs-sample-pipeline.yaml")
+		mavenSlavePipelinePath        = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "maven-pipeline.yaml")
+		mavenSlaveGradlePipelinePath  = exutil.FixturePath("testdata", "builds", "gradle-pipeline.yaml")
+		blueGreenPipelinePath         = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "bluegreen-pipeline.yaml")
+		envVarsPipelinePath           = exutil.FixturePath("testdata", "samplepipeline-withenvs.yaml")
+		oc                            = exutil.NewCLI("jenkins-pipeline", exutil.KubeConfigPath())
+		ticker                        *time.Ticker
+		j                             *jenkins.JenkinsRef
+		pvs                           = []*corev1.PersistentVolume{}
+		nfspod                        = &corev1.Pod{}
+
+		cleanup = func(jenkinsTemplatePath string) {
+			if g.CurrentGinkgoTestDescription().Failed {
+				exutil.DumpPodStates(oc)
+				exutil.DumpPodLogsStartingWith("", oc)
+				exutil.DumpPersistentVolumeInfo(oc)
+			}
+			if os.Getenv(jenkins.EnableJenkinsMemoryStats) != "" {
+				ticker.Stop()
+			}
+
+			client := oc.AsAdmin().KubeFramework().ClientSet
+			g.By("removing jenkins")
+			exutil.RemoveDeploymentConfigs(oc, "jenkins")
+
+			// per k8s e2e volume_util.go:VolumeTestCleanup, nuke any client pods
+			// before nfs server to assist with umount issues; as such, need to clean
+			// up prior to the AfterEach processing, to guaranteed deletion order
+			if jenkinsTemplatePath == jenkinsPersistentTemplatePath {
+				g.By("deleting PVCs")
+				exutil.DeletePVCsForDeployment(client, oc, "jenkins")
+				g.By("removing nfs pvs")
+				for _, pv := range pvs {
+					e2e.DeletePersistentVolume(client, pv.Name)
+				}
+				g.By("removing nfs pod")
+				e2e.DeletePodWithWait(oc.AsAdmin().KubeFramework(), client, nfspod)
+			}
+		}
+		setupJenkins = func(jenkinsTemplatePath string) {
+			exutil.DumpDockerInfo()
+			// Deploy Jenkins
+			// NOTE, we use these tests for both a) nightly regression runs against the latest openshift jenkins image on docker hub, and
+			// b) PR testing for changes to the various openshift jenkins plugins we support.  With scenario b), a docker image that extends
+			// our jenkins image is built, where the proposed plugin change is injected, overwritting the current released version of the plugin.
+			// Our test/PR jobs on ci.openshift create those images, as well as set env vars this test suite looks for.  When both the env var
+			// and test image is present, a new image stream is created using the test image, and our jenkins template is instantiated with
+			// an override to use that images stream and test image
+			var licensePrefix, pluginName string
+			useSnapshotImage := false
+
+			err := oc.Run("create").Args("-n", oc.Namespace(), "-f", jenkinsTemplatePath).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			jenkinsTemplateName := "jenkins-ephemeral"
+
+			// create persistent volumes if running persistent jenkins
+			if jenkinsTemplatePath == jenkinsPersistentTemplatePath {
+				g.By("PV/PVC dump before setup")
+				exutil.DumpPersistentVolumeInfo(oc)
+
+				jenkinsTemplateName = "jenkins-persistent"
+
+				nfspod, pvs, err = exutil.SetupK8SNFSServerAndVolume(oc, 3)
+				o.Expect(err).NotTo(o.HaveOccurred())
+
+			}
+
+			// our pipeline jobs, between jenkins and oc invocations, need more mem than the default
+			newAppArgs := []string{"--template", fmt.Sprintf("%s/%s", oc.Namespace(), jenkinsTemplateName), "-p", "MEMORY_LIMIT=2Gi", "-p", "DISABLE_ADMINISTRATIVE_MONITORS=true"}
+			newAppArgs = jenkins.OverridePodTemplateImages(newAppArgs)
+			clientPluginNewAppArgs, useClientPluginSnapshotImage := jenkins.SetupSnapshotImage(jenkins.UseLocalClientPluginSnapshotEnvVarName, localClientPluginSnapshotImage, localClientPluginSnapshotImageStream, newAppArgs, oc)
+			syncPluginNewAppArgs, useSyncPluginSnapshotImage := jenkins.SetupSnapshotImage(jenkins.UseLocalSyncPluginSnapshotEnvVarName, localSyncPluginSnapshotImage, localSyncPluginSnapshotImageStream, newAppArgs, oc)
+
+			switch {
+			case useClientPluginSnapshotImage && useSyncPluginSnapshotImage:
+				fmt.Fprintf(g.GinkgoWriter,
+					"\nBOTH %s and %s for PR TESTING ARE SET.  WILL NOT CHOOSE BETWEEN THE TWO SO TESTING CURRENT PLUGIN VERSIONS IN LATEST OPENSHIFT JENKINS IMAGE ON DOCKER HUB.\n",
+					jenkins.UseLocalClientPluginSnapshotEnvVarName, jenkins.UseLocalSyncPluginSnapshotEnvVarName)
+			case useClientPluginSnapshotImage:
+				fmt.Fprintf(g.GinkgoWriter, "\nTHE UPCOMING TESTS WILL LEVERAGE AN IMAGE THAT EXTENDS THE LATEST OPENSHIFT JENKINS IMAGE AND OVERRIDES THE OPENSHIFT CLIENT PLUGIN WITH A NEW VERSION BUILT FROM PROPOSED CHANGES TO THAT PLUGIN.\n")
+				licensePrefix = clientLicenseText
+				pluginName = clientPluginName
+				useSnapshotImage = true
+				newAppArgs = clientPluginNewAppArgs
+			case useSyncPluginSnapshotImage:
+				fmt.Fprintf(g.GinkgoWriter, "\nTHE UPCOMING TESTS WILL LEVERAGE AN IMAGE THAT EXTENDS THE LATEST OPENSHIFT JENKINS IMAGE AND OVERRIDES THE OPENSHIFT SYNC PLUGIN WITH A NEW VERSION BUILT FROM PROPOSED CHANGES TO THAT PLUGIN.\n")
+				licensePrefix = syncLicenseText
+				pluginName = syncPluginName
+				useSnapshotImage = true
+				newAppArgs = syncPluginNewAppArgs
+			default:
+				fmt.Fprintf(g.GinkgoWriter, "\nNO PR TEST ENV VARS SET SO TESTING CURRENT PLUGIN VERSIONS IN LATEST OPENSHIFT JENKINS IMAGE ON DOCKER HUB.\n")
+			}
+
+			g.By(fmt.Sprintf("calling oc new-app useSnapshotImage %v with license text %s and newAppArgs %#v", useSnapshotImage, licensePrefix, newAppArgs))
+			err = oc.Run("new-app").Args(newAppArgs...).Execute()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			if jenkinsTemplatePath == jenkinsPersistentTemplatePath {
+				g.By("PV/PVC dump after setup")
+				exutil.DumpPersistentVolumeInfo(oc)
+			}
+
+			g.By("waiting for jenkins deployment")
+			err = exutil.WaitForDeploymentConfig(oc.KubeClient(), oc.AppsClient().AppsV1(), oc.Namespace(), "jenkins", 1, false, oc)
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+			}
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			j = jenkins.NewRef(oc)
+
+			g.By("wait for jenkins to come up")
+			_, err = j.WaitForContent("", 200, 10*time.Minute, "")
+
+			if err != nil {
+				exutil.DumpApplicationPodLogs("jenkins", oc)
+			}
+
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			if useSnapshotImage {
+				g.By("verifying the test image is being used")
+				// for the test image, confirm that a snapshot version of the plugin is running in the jenkins image we'll test against
+				_, err = j.WaitForContent(licensePrefix+` ([0-9\.]+)-SNAPSHOT`, 200, 10*time.Minute, "/pluginManager/plugin/"+pluginName+"/thirdPartyLicenses")
+				o.Expect(err).NotTo(o.HaveOccurred())
+			}
+
+			// Start capturing logs from this deployment config.
+			// This command will terminate if the Jenkins instance crashes. This
+			// ensures that even if the Jenkins DC restarts, we should capture
+			// logs from the crash.
+			_, _, _, err = oc.Run("logs").Args("-f", "dc/jenkins").Background()
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			if os.Getenv(jenkins.EnableJenkinsMemoryStats) != "" {
+				ticker = jenkins.StartJenkinsMemoryTracking(oc, oc.Namespace())
+			}
+
+			g.By("waiting for default service account")
+			err = exutil.WaitForServiceAccount(oc.KubeClient().Core().ServiceAccounts(oc.Namespace()), "default")
+			o.Expect(err).NotTo(o.HaveOccurred())
+			g.By("waiting for builder service account")
+			err = exutil.WaitForServiceAccount(oc.KubeClient().Core().ServiceAccounts(oc.Namespace()), "builder")
+			o.Expect(err).NotTo(o.HaveOccurred())
+		}
+
+		debugAnyJenkinsFailure = func(br *exutil.BuildResult, name string, oc *exutil.CLI, dumpMaster bool) {
+			if !br.BuildSuccess {
+				br.LogDumper = jenkins.DumpLogs
+				fmt.Fprintf(g.GinkgoWriter, "\n\n START debugAnyJenkinsFailure\n\n")
+				j := jenkins.NewRef(oc)
+				jobLog, err := j.GetJobConsoleLogsAndMatchViaBuildResult(br, "")
+				if err == nil {
+					fmt.Fprintf(g.GinkgoWriter, "\n %s job log:\n%s", name, jobLog)
+				} else {
+					fmt.Fprintf(g.GinkgoWriter, "\n error getting %s job log: %#v", name, err)
+				}
+				if dumpMaster {
+					exutil.DumpApplicationPodLogs("jenkins", oc)
+				}
+				fmt.Fprintf(g.GinkgoWriter, "\n\n END debugAnyJenkinsFailure\n\n")
+			}
+		}
+	)
 
 	// these tests are isolated so that PR testing the jenkins-client-plugin can execute the extended
 	// tests with a ginkgo focus that runs only the tests within this ginkgo context
-	g.Context("jenkins-client-plugin tests", func() {
-
-		g.It("using the ephemeral template", func() {
-			defer cleanup(jenkinsEphemeralTemplatePath)
-			setupJenkins(jenkinsEphemeralTemplatePath)
-
-			g.By("Pipeline using jenkins-client-plugin")
-
-			g.By("should build and complete successfully", func() {
-				// instantiate the bc
-				g.By("create the jenkins pipeline strategy build config that leverages openshift client plugin")
-				err := oc.Run("create").Args("-f", clientPluginPipelinePath).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-
-				// start the build - we run it twice because our sample pipeline exercises different paths of the client
-				// plugin based on whether certain resources already exist or not
-				for i := 0; i < 2; i++ {
-					g.By(fmt.Sprintf("starting the pipeline build and waiting for it to complete, pass: %d", i))
-					br, err := exutil.StartBuildAndWait(oc, "sample-pipeline-openshift-client-plugin")
-					debugAnyJenkinsFailure(br, oc.Namespace()+"-sample-pipeline-openshift-client-plugin", oc, true)
-					if err != nil || !br.BuildSuccess {
-						exutil.DumpBuilds(oc)
-						exutil.DumpBuildLogs("ruby", oc)
-						exutil.DumpDeploymentLogs("mongodb", 1, oc)
-						exutil.DumpDeploymentLogs("jenkins-second-deployment", 1, oc)
-						exutil.DumpDeploymentLogs("jenkins-second-deployment", 2, oc)
-					}
-					br.AssertSuccess()
-
-					g.By("get build console logs and see if succeeded")
-					_, err = j.GetJobConsoleLogsAndMatchViaBuildResult(br, "Finished: SUCCESS")
-					o.Expect(err).NotTo(o.HaveOccurred())
-				}
-
-				g.By("clean up openshift resources for next potential run")
-				err = oc.Run("delete").Args("bc", "sample-pipeline-openshift-client-plugin").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("dc", "jenkins-second-deployment").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("bc", "ruby").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("is", "ruby").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("is", "ruby-22-centos7").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("all", "-l", "template=mongodb-ephemeral-template").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("template", "mongodb-ephemeral").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("secret", "mongodb").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-			})
-
-			g.By("should handle multi-namespace templates", func() {
-				g.By("create additional projects")
-				namespace := oc.Namespace()
-				namespace2 := oc.Namespace() + "-2"
-				namespace3 := oc.Namespace() + "-3"
-
-				err := oc.Run("new-project").Args(namespace2).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("new-project").Args(namespace3).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				// no calls to delete these two projects here; leads to timing
-				// issues with the framework deleting all namespaces
-
-				g.By("set up policy for jenkins jobs in " + namespace2)
-				err = oc.Run("policy").Args("add-role-to-user", "edit", "system:serviceaccount:"+namespace+":jenkins", "-n", namespace2).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				g.By("set up policy for jenkins jobs in " + namespace3)
-				err = oc.Run("policy").Args("add-role-to-user", "edit", "system:serviceaccount:"+namespace+":jenkins", "-n", namespace3).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-
-				// instantiate the bc
-				g.By("instantiate the jenkins pipeline strategy build config that leverages openshift client plugin with multiple namespaces")
-				err = oc.Run("new-app").Args("-f", multiNamespaceClientPluginPipelinePath, "-p", "NAMESPACE="+namespace, "-p", "NAMESPACE2="+namespace2, "-p", "NAMESPACE3="+namespace3).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-
-				// run the build
-				g.By("starting the pipeline build and waiting for it to complete")
-				br, err := exutil.StartBuildAndWait(oc, "multi-namespace-pipeline")
-				debugAnyJenkinsFailure(br, oc.Namespace()+"-multi-namespace-pipeline", oc, true)
-				if err != nil || !br.BuildSuccess {
-					exutil.DumpBuilds(oc)
-				}
-				br.AssertSuccess()
-
-				g.By("get build console logs and see if succeeded")
-				_, err = j.GetJobConsoleLogsAndMatchViaBuildResult(br, "Finished: SUCCESS")
-				o.Expect(err).NotTo(o.HaveOccurred())
-
-				g.By("confirm there are objects in second and third namespaces")
-				defer oc.SetNamespace(namespace)
-				oc.SetNamespace(namespace2)
-				output, err := oc.Run("get").Args("all").Output()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				o.Expect(output).To(o.ContainSubstring("deploymentconfig.apps.openshift.io/mongodb"))
-				oc.SetNamespace(namespace3)
-				output, err = oc.Run("get").Args("all").Output()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				o.Expect(output).To(o.ContainSubstring("service/mongodb"))
-
-				g.By("clean up openshift resources for next potential run")
-				oc.SetNamespace(namespace)
-				err = oc.Run("delete").Args("bc", "multi-namespace-pipeline").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("all", "-l", "template=mongodb-ephemeral-template").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-				err = oc.Run("delete").Args("template", "mongodb-ephemeral").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-			})
-		})
-	})
-
 	g.Context("Sync plugin tests", func() {
 
 		g.It("using the persistent template", func() {

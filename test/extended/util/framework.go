@@ -557,6 +557,24 @@ func (t *BuildResult) Logs() (string, error) {
 	return buildOuput, nil
 }
 
+// LogsNoTimestamp returns the logs associated with this build.
+func (t *BuildResult) LogsNoTimestamp() (string, error) {
+	if t == nil || t.BuildPath == "" {
+		return "", fmt.Errorf("Not enough information to retrieve logs for %#v", *t)
+	}
+
+	if t.LogDumper != nil {
+		return t.LogDumper(t.Oc, t)
+	}
+
+	buildOuput, err := t.Oc.Run("logs").Args("-f", t.BuildPath).Output()
+	if err != nil {
+		return "", fmt.Errorf("Error retrieving logs for %#v: %v", *t, err)
+	}
+
+	return buildOuput, nil
+}
+
 // Dumps logs and triggers a Ginkgo assertion if the build did NOT succeed.
 func (t *BuildResult) AssertSuccess() *BuildResult {
 	if !t.BuildSuccess {
@@ -684,7 +702,7 @@ func WaitForABuild(c buildv1clienttyped.BuildInterface, name string, isOK, isFai
 		return err
 	}
 	// wait longer for the build to run to completion
-	err = wait.Poll(5*time.Second, 60*time.Minute, func() (bool, error) {
+	err = wait.Poll(5*time.Second, 10*time.Minute, func() (bool, error) {
 		list, err := c.List(metav1.ListOptions{FieldSelector: fields.Set{"metadata.name": name}.AsSelector().String()})
 		if err != nil {
 			e2e.Logf("error listing builds: %v", err)

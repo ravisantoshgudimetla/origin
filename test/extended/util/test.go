@@ -438,6 +438,8 @@ var (
 			regexp.QuoteMeta("[Area:Networking] NetworkPolicy"),
 			regexp.QuoteMeta("[Area:Networking] network isolation"),
 			regexp.QuoteMeta("[Area:Networking] services when using a plugin"),
+			regexp.QuoteMeta("[Feature:Builds] result image should have proper labels set"),
+			regexp.QuoteMeta("[Feature:Builds][Conformance] oc new-app"),
 		},
 	}
 
@@ -449,6 +451,14 @@ var (
 			`Kubectl taint \[Serial\]`,
 			// flaking, very slow
 			`100 namespaces in 150 seconds`,
+
+			// appear to be flaking
+			`should run a successful deployment with multiple triggers`,
+			`should run a successful deployment with a trigger used by different containers`,
+
+			// flaking left and right
+			// Dec  1 01:23:01.913: INFO: resource secrets, expected 6, actual 7
+			`should create a ResourceQuota and capture the life of a secret`,
 		},
 	}
 
